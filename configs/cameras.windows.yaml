@@ -1,0 +1,146 @@
+"""
+Example configuration file for cameras - WINDOWS VERSION
+Copy this to cameras.yaml and customize for your environment.
+"""
+
+# System-level configuration
+system:
+  # Base directories (use Windows paths)
+  base_cache_dir: "./data/cache"                  # Directory for ring buffer TS segments
+  base_video_dir: "./data/video"                  # Directory for final event videos
+  db_path: "./data/db/events.db"                  # SQLite database path
+  log_dir: "./data/logs"                          # Log directory
+  
+  # FFmpeg and system settings
+  ffmpeg_path: "ffmpeg"                           # Path to ffmpeg executable (or full path)
+  log_level: "INFO"                               # Log level: DEBUG, INFO, WARNING, ERROR
+  
+  # Scheduler settings
+  scheduler_interval_sec: 1.0                     # How often to check for finalization
+  file_cleanup_interval_sec: 30.0                 # How often to clean old cache files
+  
+  # API settings (optional)
+  enable_api: false                               # Enable FastAPI endpoint
+  api_host: "0.0.0.0"
+  api_port: 8000
+
+# Camera configurations
+cameras:
+  
+  # Example Camera 1: Parking Lot Entrance
+  cam_001:
+    name: "Parking Lot Entrance"
+    ip: "192.168.1.100"
+    rtsp_url: "rtsp://admin:password@192.168.1.100:554/stream1"
+    # FTP directory where camera uploads alarm images
+    # On Windows, use forward slashes or double backslashes
+    ftp_image_dir: "./data/ftp/cam_001"
+    event_type: "line_crossing"                   # Event type
+    enabled: true
+    
+    # Recording parameters (in seconds)
+    pre_seconds: 5                                 # Record 5 seconds before alarm
+    post_seconds: 10                               # Record 10 seconds after alarm
+    cache_seconds: 120                             # Keep 120 seconds of circular buffer
+    cooldown_seconds: 3                            # Minimum interval between repeated alarms
+    max_extend_seconds: 60                         # Max extension for continued recording
+    
+    # Output directory (if not set, uses base_video_dir)
+    output_dir: "./data/video/cam_001"
+  
+  # Example Camera 2: Warehouse Door
+  cam_002:
+    name: "Warehouse Door"
+    ip: "192.168.1.101"
+    rtsp_url: "rtsp://admin:password@192.168.1.101:554/stream1"
+    ftp_image_dir: "./data/ftp/cam_002"
+    event_type: "intrusion"
+    enabled: true
+    
+    pre_seconds: 10
+    post_seconds: 15
+    cache_seconds: 180
+    cooldown_seconds: 2
+    max_extend_seconds: 90
+    output_dir: "./data/video/cam_002"
+  
+  # Example Camera 3: Loading Bay (disabled for demo)
+  cam_003:
+    name: "Loading Bay"
+    ip: "192.168.1.102"
+    rtsp_url: "rtsp://admin:password@192.168.1.102:554/stream1"
+    ftp_image_dir: "./data/ftp/cam_003"
+    event_type: "loitering"
+    enabled: false
+    
+    pre_seconds: 3
+    post_seconds: 8
+    cache_seconds: 60
+    cooldown_seconds: 5
+    max_extend_seconds: 45
+
+
+# WINDOWS-SPECIFIC NOTES:
+#
+# 1. FFmpeg Installation:
+#    - Download from: https://ffmpeg.org/download.html
+#    - Extract to a folder and add to PATH, OR
+#    - Use Chocolatey: choco install ffmpeg
+#    - Verify: ffmpeg -version
+#
+# 2. RTSP URL Format:
+#    - Most Hikvision cameras: rtsp://admin:password@ip:554/Streaming/Channels/101
+#    - Some models: rtsp://admin:password@ip:554/stream1
+#
+# 3. FTP Image Directory:
+#    - Can use relative paths: "./data/ftp/cam_001"
+#    - Or absolute paths: "C:/data/ftp/cam_001" or "C:\\data\\ftp\\cam_001"
+#    - On Windows, either forward slashes (/) or double backslashes (\\) work in YAML
+#    - Single backslash (\) may cause parsing issues - avoid!
+#
+# 4. File Paths in YAML:
+#    CORRECT:
+#      ftp_image_dir: "C:/Users/Admin/ftp/cam_001"
+#      ftp_image_dir: "C:\\Users\\Admin\\ftp\\cam_001"
+#      ftp_image_dir: "./data/ftp/cam_001"
+#    
+#    WRONG (will cause errors):
+#      ftp_image_dir: "C:\Users\Admin\ftp\cam_001"    # Single backslash
+#
+# 5. Running on Windows:
+#    - Double-click run.bat in the scripts folder
+#    - Or from PowerShell: .\scripts\run.bat
+#    - The script will:
+#      * Create a Python virtual environment
+#      * Install dependencies
+#      * Start the system
+#
+# 6. Camera Configuration:
+#    - Configure your cameras (via their web UI) to upload alarm images via FTP
+#    - Set FTP server to: localhost or <your_machine_ip>
+#    - FTP username/password: (optional, not used by this system)
+#    - Upload directory: Should match ftp_image_dir in config
+#
+# 7. Parameters:
+#    - pre_seconds: How long before alarm to include in video
+#    - post_seconds: How long after alarm to wait before ending recording
+#    - cache_seconds: Total rolling buffer size (must be > pre_seconds + post_seconds)
+#    - cooldown_seconds: Debounce - prevents repeated alarms from same camera
+#    - max_extend_seconds: Cap on total event duration (from first alarm)
+#
+# 8. Event Types:
+#    - line_crossing: For line crossing detection
+#    - intrusion: For intrusion/trespassing detection
+#    - loitering: For loitering detection
+#
+# 9. API:
+#    - If enable_api is true, API runs on http://localhost:8000
+#    - Endpoints: /health, /status, /cameras, /events, /health/recorders
+#
+# 10. Troubleshooting on Windows:
+#     - If ffmpeg not found: Make sure it's installed and in PATH
+#       Test: Open cmd and type "ffmpeg -version"
+#     - If Python not found: Install Python 3.11+ from python.org
+#       Make sure "Add Python to PATH" is checked during installation
+#     - If FTP dir doesn't work: Use forward slashes or double backslashes
+#     - Check logs in: data/logs/event_system.log
