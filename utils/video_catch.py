@@ -14,6 +14,7 @@ import requests
 
 from dotenv import load_dotenv
 
+load_dotenv()
 # mcp = FastMCP("CameraClipUploadServer")
 executor = ThreadPoolExecutor(max_workers=1)
 

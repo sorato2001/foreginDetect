@@ -11,7 +11,7 @@ import time
 import requests
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 from dotenv import load_dotenv
 from ultralytics import YOLO
@@ -20,14 +20,23 @@ import dashscope
 from .models import ActiveEvent, EventRecord, EventStatus
 from .utils import find_ts_files_in_range, generate_concat_file, get_video_output_path
 
+MediaType = Literal["image", "video"]
 
 logger = logging.getLogger(__name__)
+
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(env_path)
+
+logger.info(f"Loaded environment variables from {env_path}")
 
 DASHSCOPE_UPLOAD_API = "https://dashscope.aliyuncs.com/api/v1/uploads"
 
 
 def get_upload_policy(api_key: str, model_name: str, max_retries: int = 5) -> Dict[str, Any]:
-    """Get file upload policy from DashScope."""
+    """
+    获取文件上传凭证（getPolicy）
+    注意：该接口有限流（按 主账号+模型 维度），这里做简单重试退避。:contentReference[oaicite:1]{index=1}
+    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -45,6 +54,7 @@ def get_upload_policy(api_key: str, model_name: str, max_retries: int = 5) -> Di
                     raise RuntimeError(f"Unexpected response: {data}")
                 return data["data"]
 
+            # 429/5xx 做退避重试
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = f"{resp.status_code} {resp.text}"
                 time.sleep(backoff)
@@ -115,28 +125,71 @@ def extract_text(resp: Any) -> str:
 
     return str(resp)
 
+def _extract_text(resp: Any) -> str:
+    """
+    尽量从 DashScope 响应里抽取 assistant 文本，兼容对象/字典两种返回。
+    """
+    # 对象形态：resp.output.choices[0].message.content -> [{"text": "..."}]
+    try:
+        content = resp.output.choices[0].message.content
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and "text" in item:
+                    return item["text"]
+        if isinstance(content, str):
+            return content
+    except Exception:
+        pass
+
+    # 字典形态
+    try:
+        content = resp["output"]["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and "text" in item:
+                    return item["text"]
+        if isinstance(content, str):
+            return content
+    except Exception:
+        pass
+
+    return str(resp)
+
 
 def call_multimodal(
     temp_url: str,
     prompt: str,
     model: str,
-    api_key: str,
+    media_type: MediaType,
+    api_key: Optional[str],
 ) -> Dict[str, Any]:
-    """Call Qwen VLM API with video URL."""
-    if not temp_url.startswith("oss://"):
-        return {"status": "error", "msg": "temp_url must start with oss://"}
+    
 
+
+    # DashScope 多模态对话消息结构：{"image": "..."} 或 {"video": "..."} + {"text": "..."}
+    media_item = {media_type: temp_url}
     messages = [
         {
             "role": "user",
             "content": [
-                {"video": temp_url},
+                media_item,
                 {"text": prompt},
             ],
         }
     ]
 
     try:
+        if not api_key:
+            logger.error({"status": "error", "msg": "请设置环境变量 DASHSCOPE_API_KEY 或传入 api_key 参数"})
+            return {"status": "error", "msg": "请设置环境变量 DASHSCOPE_API_KEY 或传入 api_key 参数"}
+
+        if not temp_url.startswith("oss://"):
+            logger.error({"status": "error", "msg": "temp_url 需要是 oss:// 开头的临时URL"})
+            return {"status": "error", "msg": "temp_url 需要是 oss:// 开头的临时URL"}
+
+        masked = api_key[:6] + "..." + api_key[-4:]
+        logger.info(f"API key for DashScope: found:{masked}")
+        
         resp = dashscope.MultiModalConversation.call(
             api_key=api_key,
             model=model,
@@ -145,14 +198,22 @@ def call_multimodal(
         return {
             "status": "success",
             "model": model,
-            "answer": extract_text(resp),
+            "media_type": media_type,
+            "temp_url": temp_url,
+            "prompt": prompt,
+            "answer": _extract_text(resp),
             "raw": resp,
         }
     except Exception as e:
+        logger.error(f"Error calling multimodal model: {e}")
         return {
             "status": "error",
             "msg": str(e),
+            "model": model,
+            "media_type": media_type,
+            "temp_url": temp_url,
         }
+
 
 
 class EventFinalizer:
@@ -451,7 +512,6 @@ class EventAnalyzer:
                 raise RuntimeError(f"Could not load YOLO model: {e2}")
         
         self.qwen_model = qwen_model
-        load_dotenv()  # Load environment variables for API keys
 
         logger.info("Initialized EventAnalyzer with YOLO and Qwen VLM")
 
@@ -470,58 +530,108 @@ class EventAnalyzer:
             logger.info(f"Running YOLO detection on {video_path}")
 
             # Use streaming inference to avoid storing all results in memory
-            # and reduce peak memory usage by resizing frames.
             stream_args = {
                 "stream": True,
                 "imgsz": 640,
                 "verbose": False,
             }
 
-            person_detections = []
+            total_person_detections = []
+            max_persons_in_single_frame = 0
+            person_frames = 0
+            frame_results = []
+
+            detected_reason = "none"
             frame_idx = 0
 
-            try:
+            def run_yolo_pass(stream_args):
+                nonlocal detected_reason
+
+                total_person_detections_local = []
+                max_persons_in_single_frame_local = 0
+                person_frames_local = 0
+                frame_results_local = []
+                frame_idx_local = 0
+
                 for result in self.yolo.predict(source=video_path, **stream_args):
-                    frame_idx += 1
+                    frame_idx_local += 1
 
-                    if result.boxes is None:
-                        continue
+                    frame_persons = 0
+                    frame_boxes = []
 
-                    for box in result.boxes:
-                        cls_id = int(box.cls.item())
-                        conf = float(box.conf.item())
-                        if cls_id == 0:  # person class in COCO
-                            person_detections.append({
-                                "confidence": conf,
-                                "bbox": box.xyxy[0].tolist(),
-                                "frame_index": frame_idx,
-                            })
+                    if result.boxes is not None:
+                        for box in result.boxes:
+                            cls_id = int(box.cls.item())
+                            conf = float(box.conf.item())
 
-            except MemoryError as me:
+                            if cls_id == 0:  # person class in COCO
+                                frame_persons += 1
+                                total_person_detections_local.append({
+                                    "confidence": conf,
+                                    "bbox": box.xyxy[0].tolist(),
+                                    "frame_index": frame_idx_local,
+                                })
+                                frame_boxes.append({
+                                    "confidence": conf,
+                                    "bbox": box.xyxy[0].tolist(),
+                                })
+
+                    if frame_persons > 0:
+                        person_frames_local += 1
+                        detected_reason = "YOLO: person_detected"
+
+                    max_persons_in_single_frame_local = max(
+                        max_persons_in_single_frame_local,
+                        frame_persons
+                    )
+
+                    frame_results_local.append({
+                        "frame_index": frame_idx_local,
+                        "person_count": frame_persons,
+                        "boxes": frame_boxes,
+                    })
+
+                return (
+                    total_person_detections_local,
+                    max_persons_in_single_frame_local,
+                    person_frames_local,
+                    frame_results_local,
+                )
+
+            try:
+                (
+                    total_person_detections,
+                    max_persons_in_single_frame,
+                    person_frames,
+                    frame_results,
+                ) = run_yolo_pass(stream_args)
+
+            except MemoryError:
                 logger.warning(
                     "YOLO inference ran out of memory; retrying with smaller resolution",
                     exc_info=True,
                 )
-                # Retry with even smaller image size
                 stream_args["imgsz"] = 480
-                person_detections = []
-                frame_idx = 0
-                for result in self.yolo.predict(source=video_path, **stream_args):
-                    frame_idx += 1
-                    if result.boxes is None:
-                        continue
-                    for box in result.boxes:
-                        cls_id = int(box.cls.item())
-                        conf = float(box.conf.item())
-                        if cls_id == 0:
-                            person_detections.append({
-                                "confidence": conf,
-                                "bbox": box.xyxy[0].tolist(),
-                                "frame_index": frame_idx,
-                            })
+                detected_reason = "none"
+
+                (
+                    total_person_detections,
+                    max_persons_in_single_frame,
+                    person_frames,
+                    frame_results,
+                ) = run_yolo_pass(stream_args)
+
+            logger.info(
+                "YOLO finished: total_person_detections=%d, max_persons_in_single_frame=%d, person_frames=%d",
+                len(total_person_detections),
+                max_persons_in_single_frame,
+                person_frames,
+            )
 
             # 2. Upload video to DashScope for VLM analysis
             api_key = os.getenv("DASHSCOPE_API_KEY")
+            masked = api_key[:6] + "..." + api_key[-4:]
+            logger.info(f"API key for DashScope: found:{masked}")
             if not api_key:
                 logger.error("DASHSCOPE_API_KEY not found in environment")
                 return {"status": "error", "message": "Missing API key"}
@@ -538,27 +648,44 @@ class EventAnalyzer:
                 "2) 异常类型\n"
                 "3) 关键证据（画面描述 + 发生在视频的哪个时间段）\n"
                 "4) 建议处置\n"
-                f"\n检测到的人员数量: {len(person_detections)}"
+                f"\n检测到的人员数量: {max_persons_in_single_frame}"
+                f"\n触发原因: {detected_reason}"
             )
+
+            logger.info(f"Calling multimodal model {self.qwen_model} with media {temp_url} and prompt: {prompt}")
 
             vlm_result = call_multimodal(
                 temp_url=temp_url,
                 prompt=prompt,
                 model=self.qwen_model,
+                media_type="video",
                 api_key=api_key
             )
+
+            
+            # analysis_result = {
+            #     "status": "success",
+            #     "person_count": max_persons_in_single_frame,   # 关键：这里才是真正的人数
+            #     "total_person_detections": len(total_person_detections),
+            #     "person_frames": person_frames,
+            #     "frame_results": frame_results,
+            #     "detected_reason": detected_reason,
+            # }
 
             analysis = {
                 "status": "success",
                 "yolo_detections": {
-                    "person_count": len(person_detections),
-                    "detections": person_detections
+                    "person_count": max_persons_in_single_frame,   # 关键：这里才是真正的人数
+                    "total_person_detections": len(total_person_detections),
+                    "person_frames": person_frames,
+                    # "frame_results": frame_results,
+                    "detected_reason": detected_reason,
                 },
                 "vlm_analysis": vlm_result,
                 "temp_url": temp_url
             }
 
-            logger.info(f"Analysis complete for {video_path}: {len(person_detections)} persons detected")
+            logger.info(f"Analysis complete for {video_path}: {max_persons_in_single_frame} persons detected")
             return analysis
 
         except Exception as e:

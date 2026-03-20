@@ -17,6 +17,7 @@ from video_catch import upload_file_and_get_url  # :contentReference[oaicite:4]{
 # 来自 qwen_test.py: 调用多模态VLM
 from qwen_test import _call_multimodal           # :contentReference[oaicite:5]{index=5}
 
+load_dotenv()
 
 # ----------------------------
 # 画 YOLO 框（给可视化视频用）

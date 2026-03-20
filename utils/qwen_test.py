@@ -8,6 +8,7 @@ import dashscope
 # from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 
+load_dotenv()
 # mcp = FastMCP("TempUrlLLMCallServer")
 executor = ThreadPoolExecutor(max_workers=4)
 
@@ -53,7 +54,6 @@ def _call_multimodal(
     api_key: Optional[str],
 ) -> Dict[str, Any]:
     
-    load_dotenv()
     api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
         return {"status": "error", "msg": "请设置环境变量 DASHSCOPE_API_KEY 或传入 api_key 参数"}
