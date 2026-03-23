@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 import requests
+import cv2
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Literal
@@ -536,6 +537,28 @@ class EventAnalyzer:
                 "verbose": False,
             }
 
+            source_path = Path(video_path)
+            yolo_video_path = str(source_path.with_name(f"{source_path.stem}_yolo{source_path.suffix}"))
+
+            # Set up writer for YOLO overlay video
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video for YOLO overlay: {video_path}")
+
+            fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+            cap.release()
+
+            yolo_writer = cv2.VideoWriter(
+                yolo_video_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                float(fps),
+                (width, height),
+            )
+            if not yolo_writer.isOpened():
+                raise RuntimeError(f"cannot open VideoWriter for yolo output: {yolo_video_path}")
+
             total_person_detections = []
             max_persons_in_single_frame = 0
             person_frames = 0
@@ -591,6 +614,17 @@ class EventAnalyzer:
                         "boxes": frame_boxes,
                     })
 
+                    # add overlay frame to writer
+                    try:
+                        annotated_frame = result.plot()
+                        if annotated_frame is not None:
+                            h, w = annotated_frame.shape[:2]
+                            if (w, h) != (width, height):
+                                annotated_frame = cv2.resize(annotated_frame, (width, height))
+                            yolo_writer.write(annotated_frame)
+                    except Exception as e:
+                        logger.warning(f"Failed to write YOLO overlay frame {frame_idx_local}: {e}")
+
                 return (
                     total_person_detections_local,
                     max_persons_in_single_frame_local,
@@ -620,6 +654,10 @@ class EventAnalyzer:
                     person_frames,
                     frame_results,
                 ) = run_yolo_pass(stream_args)
+
+            finally:
+                if 'yolo_writer' in locals() and yolo_writer.isOpened():
+                    yolo_writer.release()
 
             logger.info(
                 "YOLO finished: total_person_detections=%d, max_persons_in_single_frame=%d, person_frames=%d",
@@ -674,6 +712,7 @@ class EventAnalyzer:
 
             analysis = {
                 "status": "success",
+                "yolo_video_path": yolo_video_path,
                 "yolo_detections": {
                     "person_count": max_persons_in_single_frame,   # 关键：这里才是真正的人数
                     "total_person_detections": len(total_person_detections),
