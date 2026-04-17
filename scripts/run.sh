@@ -3,7 +3,7 @@
 # Multi-Camera Event Recording System - Startup Script
 # 
 # This script sets up the environment and starts the system.
-# Usage: ./run.sh [config_file] [log_level]
+# Usage: ./run.sh [config_file] [log_level] [analysis_mode]
 
 set -e
 
@@ -11,6 +11,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${1:-$SCRIPT_DIR/configs/cameras.yaml}"
 LOG_LEVEL="${2:-INFO}"
+ANALYSIS_MODE="${3:-}"
 
 echo "=============================================="
 echo "Multi-Camera Event Recording System"
@@ -18,6 +19,11 @@ echo "=============================================="
 echo "Script dir: $SCRIPT_DIR"
 echo "Config: $CONFIG_FILE"
 echo "Log level: $LOG_LEVEL"
+if [ -n "$ANALYSIS_MODE" ]; then
+    echo "Analysis mode: $ANALYSIS_MODE"
+else
+    echo "Analysis mode: use YAML/default"
+fi
 echo ""
 
 # Check if config file exists
@@ -65,4 +71,8 @@ echo ""
 
 # Run the application
 cd "$SCRIPT_DIR"
-python3 -m app.main -c "$CONFIG_FILE" -l "$LOG_LEVEL"
+RUN_CMD=(python3 -m app.main -c "$CONFIG_FILE" -l "$LOG_LEVEL")
+if [ -n "$ANALYSIS_MODE" ]; then
+    RUN_CMD+=(--analysis-mode "$ANALYSIS_MODE")
+fi
+"${RUN_CMD[@]}"

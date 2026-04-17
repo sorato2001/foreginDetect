@@ -3,7 +3,7 @@ Data models for the multi-camera event recording system.
 """
 
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -53,12 +53,14 @@ class ActiveEvent(BaseModel):
     alarm_time: datetime           # Time of first alarm
     event_start: datetime          # Start time for recording
     record_until: datetime         # Time to stop recording
+    media_type: Literal["video", "image"] = "video"
     event_type: EventType = EventType.LINE_CROSSING  # Type of event
     status: EventStatus = EventStatus.RECORDING
     alarm_count: int = 1           # Count of alarms in this event
     last_alarm_time: Optional[datetime] = None
     image_path: Optional[str] = None
     video_path: Optional[str] = None
+    annotated_image_path: Optional[str] = None
     analysis_result: Optional[dict] = None  # YOLO and VLM analysis results
 
 
@@ -66,12 +68,14 @@ class EventRecord(BaseModel):
     """Database record for a finalized event."""
     id: Optional[int] = None
     camera_id: str
+    media_type: Literal["video", "image"] = "video"
     event_type: str
     event_time: datetime
     event_start_time: datetime
     event_end_time: datetime
     image_path: Optional[str] = None
     video_path: Optional[str] = None
+    annotated_image_path: Optional[str] = None
     analysis_result: Optional[dict] = None
     status: str = "completed"
     alarm_count: int = 1
@@ -82,6 +86,8 @@ class EventRecord(BaseModel):
 class SystemConfig(BaseModel):
     """Overall system configuration."""
     cameras: dict[str, CameraConfig] = Field(default_factory=dict)
+    analysis_mode: Literal["video", "image"] = "video"
+    save_annotated_images: bool = False
     base_cache_dir: str = "./data/cache"
     base_video_dir: str = "./data/video"
     db_path: str = "./data/db/events.db"

@@ -112,6 +112,7 @@ echo.
 echo Next steps:
 echo   1. Edit configs\cameras.yaml with your camera settings
 echo   2. Run: scripts\run.bat
+echo      Optional: scripts\run.bat configs\cameras.yaml INFO image
 echo.
 echo For detailed help:
 echo   - See: WINDOWS_SETUP.md

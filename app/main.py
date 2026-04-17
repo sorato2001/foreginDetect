@@ -58,6 +58,7 @@ class EventSystem:
         config_path: str,
         log_level: Optional[str] = None,
         enable_api: Optional[bool] = None,
+        analysis_mode: Optional[str] = None,
     ):
         """Initialize event system.
         
@@ -73,6 +74,8 @@ class EventSystem:
             self.config.log_level = log_level
         if enable_api is not None:
             self.config.enable_api = enable_api
+        if analysis_mode:
+            self.config.analysis_mode = analysis_mode
 
         # Setup logging
         setup_logging(self.config.log_dir, self.config.log_level)
@@ -86,12 +89,17 @@ class EventSystem:
         self.db = EventDatabase(self.config.db_path)
         self.recorder_manager = RecorderManager(self.config.ffmpeg_path)
         self.event_listener = EventListener(self.config.cameras)
-        self.event_finalizer = EventFinalizer(self.config.ffmpeg_path)
+        self.event_finalizer = EventFinalizer(
+            self.config.ffmpeg_path,
+            analysis_mode=self.config.analysis_mode,
+            save_annotated_images=self.config.save_annotated_images,
+        )
         self.scheduler = EventScheduler(
             self.db,
             self.event_finalizer,
             self.config.base_cache_dir,
             self.config.base_video_dir,
+            analysis_mode=self.config.analysis_mode,
         )
         self.scheduler_loop = SchedulerLoop(
             self.scheduler,
@@ -105,8 +113,10 @@ class EventSystem:
     def start(self) -> None:
         """Start all system components."""
         try:
-            # Start recorders
-            self._start_recorders()
+            if self.config.analysis_mode == "video":
+                self._start_recorders()
+            else:
+                self.logger.info("Image analysis mode enabled, skipping RTSP recorders")
             
             # Start event listener
             self._start_event_listener()
@@ -121,6 +131,7 @@ class EventSystem:
             self.logger.info("=" * 60)
             self.logger.info(f"System started successfully!")
             self.logger.info(f"Cameras: {len(self.config.cameras)}")
+            self.logger.info(f"Analysis mode: {self.config.analysis_mode}")
             self.logger.info(f"Cache dir: {self.config.base_cache_dir}")
             self.logger.info(f"Video output dir: {self.config.base_video_dir}")
             self.logger.info(f"Database: {self.config.db_path}")
@@ -261,7 +272,17 @@ class EventSystem:
     def _on_event_finalized(self, event_record) -> None:
         """Callback when event is finalized."""
         self.logger.info(f"Event finalized: {event_record.camera_id} "
+                        f"media={event_record.media_type} "
                         f"video={event_record.video_path} status={event_record.status}")
+        if event_record.annotated_image_path:
+            self.logger.info(f"Annotated image: {event_record.annotated_image_path}")
+        if event_record.analysis_result:
+            analysis_status = event_record.analysis_result.get("status")
+            self.logger.info(f"Analysis result status: {analysis_status}")
+            vlm_analysis = event_record.analysis_result.get("vlm_analysis") or {}
+            vlm_answer = vlm_analysis.get("answer")
+            if vlm_answer:
+                self.logger.info(f"VLM result: {vlm_answer[:300]}")
     
     def _signal_handler(self, signum, frame) -> None:
         """Handle shutdown signals."""
@@ -272,6 +293,7 @@ class EventSystem:
     def get_status(self) -> dict:
         """Get system status."""
         return {
+            "analysis_mode": self.config.analysis_mode,
             "recorder_health": self.recorder_manager.get_health_status(),
             "scheduler": self.scheduler.get_status(),
             "event_listener_running": self.event_listener.is_running(),
@@ -306,6 +328,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Disable REST API server",
     )
+    parser.add_argument(
+        "--analysis-mode",
+        default=None,
+        choices=["video", "image"],
+        help="Select analysis mode (overrides YAML config)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -313,6 +341,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         config_path=args.config,
         log_level=args.log_level,
         enable_api=not args.no_api,
+        analysis_mode=args.analysis_mode,
     )
 
     stop_event = threading.Event()

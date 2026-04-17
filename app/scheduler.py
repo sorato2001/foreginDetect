@@ -7,10 +7,9 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Callable
-from collections import defaultdict
+from typing import Callable, Dict, Optional
 
-from .models import AlarmEvent, ActiveEvent, EventStatus, EventRecord, EventType, CameraConfig
+from .models import AlarmEvent, ActiveEvent, CameraConfig, EventRecord, EventStatus
 from .database import EventDatabase
 from .event_finalizer import EventFinalizer
 
@@ -30,6 +29,7 @@ class EventScheduler:
         finalizer: EventFinalizer,
         cache_dir: str,
         output_dir: str,
+        analysis_mode: str = "video",
     ):
         """
         Initialize event scheduler.
@@ -44,6 +44,7 @@ class EventScheduler:
         self.finalizer = finalizer
         self.cache_dir = cache_dir
         self.output_dir = output_dir
+        self.analysis_mode = analysis_mode
         
         # Active events per camera: camera_id -> ActiveEvent
         self.active_events: Dict[str, ActiveEvent] = {}
@@ -119,6 +120,7 @@ class EventScheduler:
             alarm_time=alarm_event.event_time,
             event_start=event_start,
             record_until=record_until,
+            media_type=self.analysis_mode,
             event_type=alarm_event.event_type,
             status=EventStatus.RECORDING,
             alarm_count=1,
@@ -164,11 +166,13 @@ class EventScheduler:
             new_record_until = max_allowed
             logger.info(f"Event extension limited by max_extend_seconds for {camera_id}")
         
+        active_event.alarm_count += 1
+        active_event.last_alarm_time = alarm_event.event_time
+        active_event.image_path = alarm_event.image_path
+
         # Only update if extending
         if new_record_until > active_event.record_until:
             active_event.record_until = new_record_until
-            active_event.alarm_count += 1
-            active_event.last_alarm_time = alarm_event.event_time
             
             logger.info(f"Extended event for {camera_id}: "
                        f"record_until={new_record_until} "
@@ -244,12 +248,14 @@ class EventScheduler:
             # Create database record
             event_record = EventRecord(
                 camera_id=camera_id,
+                media_type=active_event.media_type,
                 event_type=active_event.event_type.value,
                 event_time=active_event.alarm_time,
                 event_start_time=active_event.event_start,
                 event_end_time=active_event.record_until,
                 image_path=active_event.image_path,
                 video_path=video_path,
+                annotated_image_path=active_event.annotated_image_path,
                 analysis_result=active_event.analysis_result,
                 status=status,
                 alarm_count=active_event.alarm_count,
@@ -293,6 +299,7 @@ class EventScheduler:
                     {
                         "camera_id": event.camera_id,
                         "status": event.status,
+                        "media_type": event.media_type,
                         "alarm_time": event.alarm_time.isoformat(),
                         "record_until": event.record_until.isoformat(),
                         "alarm_count": event.alarm_count,

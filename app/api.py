@@ -5,13 +5,10 @@ Provides endpoints for status, event list, and camera status.
 
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-
-from .models import EventStatus
-
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +88,7 @@ def create_app(event_system) -> FastAPI:
                 "name": config.name,
                 "ip": config.ip,
                 "enabled": config.enabled,
+                "analysis_mode": app.event_system.config.analysis_mode,
                 "recorder_healthy": recorder.is_healthy() if recorder else False,
                 "active_event": None,
             }
@@ -98,6 +96,7 @@ def create_app(event_system) -> FastAPI:
             if active_event:
                 camera_info["active_event"] = {
                     "status": active_event.status,
+                    "media_type": active_event.media_type,
                     "alarm_time": active_event.alarm_time.isoformat(),
                     "record_until": active_event.record_until.isoformat(),
                     "alarm_count": active_event.alarm_count,
@@ -136,6 +135,7 @@ def create_app(event_system) -> FastAPI:
             "ip": config.ip,
             "rtsp_url": config.rtsp_url,
             "enabled": config.enabled,
+            "analysis_mode": app.event_system.config.analysis_mode,
             "cache_seconds": config.cache_seconds,
             "pre_seconds": config.pre_seconds,
             "post_seconds": config.post_seconds,
@@ -150,6 +150,7 @@ def create_app(event_system) -> FastAPI:
         if active_event:
             camera_info["active_event"] = {
                 "status": active_event.status,
+                "media_type": active_event.media_type,
                 "alarm_time": active_event.alarm_time.isoformat(),
                 "event_start": active_event.event_start.isoformat(),
                 "record_until": active_event.record_until.isoformat(),
@@ -185,12 +186,15 @@ def create_app(event_system) -> FastAPI:
                 {
                     "id": event.id,
                     "camera_id": event.camera_id,
+                    "media_type": event.media_type,
                     "event_type": event.event_type,
                     "event_time": event.event_time.isoformat(),
                     "event_start_time": event.event_start_time.isoformat(),
                     "event_end_time": event.event_end_time.isoformat(),
                     "image_path": event.image_path,
                     "video_path": event.video_path,
+                    "annotated_image_path": event.annotated_image_path,
+                    "analysis_result": event.analysis_result,
                     "status": event.status,
                     "alarm_count": event.alarm_count,
                     "created_at": event.created_at.isoformat(),
@@ -220,12 +224,15 @@ def create_app(event_system) -> FastAPI:
         return {
             "id": event.id,
             "camera_id": event.camera_id,
+            "media_type": event.media_type,
             "event_type": event.event_type,
             "event_time": event.event_time.isoformat(),
             "event_start_time": event.event_start_time.isoformat(),
             "event_end_time": event.event_end_time.isoformat(),
             "image_path": event.image_path,
             "video_path": event.video_path,
+            "annotated_image_path": event.annotated_image_path,
+            "analysis_result": event.analysis_result,
             "status": event.status,
             "alarm_count": event.alarm_count,
             "created_at": event.created_at.isoformat(),
@@ -249,6 +256,7 @@ def create_app(event_system) -> FastAPI:
                 {
                     "camera_id": event.camera_id,
                     "status": event.status,
+                    "media_type": event.media_type,
                     "alarm_time": event.alarm_time.isoformat(),
                     "event_start": event.event_start.isoformat(),
                     "record_until": event.record_until.isoformat(),

@@ -2,7 +2,7 @@
 REM Multi-Camera Event Recording System - Windows Startup Script
 REM 
 REM This script sets up the environment and starts the system on Windows.
-REM Usage: run.bat [config_file] [log_level]
+REM Usage: run.bat [config_file] [log_level] [analysis_mode]
 
 setlocal enabledelayedexpansion
 
@@ -10,6 +10,7 @@ REM Get script directory
 set SCRIPT_DIR=%~dp0..
 set CONFIG_FILE=%1
 set LOG_LEVEL=%2
+set ANALYSIS_MODE=%3
 
 if "%CONFIG_FILE%"=="" (
     set CONFIG_FILE=%SCRIPT_DIR%\configs\cameras.yaml
@@ -17,6 +18,10 @@ if "%CONFIG_FILE%"=="" (
 
 if "%LOG_LEVEL%"=="" (
     set LOG_LEVEL=INFO
+)
+
+if /I "%ANALYSIS_MODE%"=="DEFAULT" (
+    set ANALYSIS_MODE=
 )
 
 echo.
@@ -27,6 +32,11 @@ echo.
 echo Script directory: %SCRIPT_DIR%
 echo Config file: %CONFIG_FILE%
 echo Log level: %LOG_LEVEL%
+if "%ANALYSIS_MODE%"=="" (
+    echo Analysis mode: use YAML/default
+) else (
+    echo Analysis mode: %ANALYSIS_MODE%
+)
 echo.
 
 REM Check if config file exists
@@ -116,6 +126,10 @@ echo.
 
 REM Run the application
 cd /d "%SCRIPT_DIR%"
-python -m app.main -c "%CONFIG_FILE%" -l "%LOG_LEVEL%"
+set RUN_CMD=python -m app.main -c "%CONFIG_FILE%" -l "%LOG_LEVEL%"
+if not "%ANALYSIS_MODE%"=="" (
+    set RUN_CMD=!RUN_CMD! --analysis-mode "%ANALYSIS_MODE%"
+)
+call !RUN_CMD!
 
 pause

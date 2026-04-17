@@ -1,14 +1,16 @@
 # Multi-Camera Event Recording System - Windows PowerShell Startup Script
 # 
 # This script sets up the environment and starts the system on Windows.
-# Usage: .\run.ps1 [-ConfigFile "configs/cameras.yaml"] [-LogLevel "INFO"]
+# Usage: .\run.ps1 [-ConfigFile "configs/cameras.yaml"] [-LogLevel "INFO"] [-AnalysisMode "video|image"]
 #
 # NOTE: You may need to allow script execution first:
 #   powershell -ExecutionPolicy Bypass -File .\run.ps1
 
 param(
     [string]$ConfigFile = "configs\cameras.yaml",
-    [string]$LogLevel = "INFO"
+    [string]$LogLevel = "INFO",
+    [ValidateSet("video", "image")]
+    [string]$AnalysisMode = ""
 )
 
 $ScriptDir = Split-Path -Parent (Get-Item -Path $PSCommandPath).FullName
@@ -23,6 +25,11 @@ Write-Host "Script directory: $ScriptDir"
 Write-Host "Project root: $ProjectRoot"
 Write-Host "Config file: $ConfigFile"
 Write-Host "Log level: $LogLevel"
+if ([string]::IsNullOrWhiteSpace($AnalysisMode)) {
+    Write-Host "Analysis mode: use YAML/default"
+} else {
+    Write-Host "Analysis mode: $AnalysisMode"
+}
 Write-Host ""
 
 # Resolve paths
@@ -113,7 +120,11 @@ Write-Host ""
 
 # Run the application
 Push-Location $ProjectRoot
-& python -m app.main -c $ConfigFile -l $LogLevel
+$runArgs = @("-m", "app.main", "-c", $ConfigFile, "-l", $LogLevel)
+if (-not [string]::IsNullOrWhiteSpace($AnalysisMode)) {
+    $runArgs += @("--analysis-mode", $AnalysisMode)
+}
+& python @runArgs
 Pop-Location
 
 Write-Host ""

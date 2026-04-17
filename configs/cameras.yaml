@@ -3,6 +3,8 @@
 
 # System-level configuration
 system:
+  analysis_mode: "video"                         # video | image
+  save_annotated_images: true                   # Save YOLO overlay images in image mode
   # Base directories (use Windows paths)
   base_cache_dir: "./data/cache"                  # Directory for ring buffer TS segments
   base_video_dir: "./data/video"                  # Directory for final event videos
