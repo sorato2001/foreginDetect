@@ -29,12 +29,33 @@ cameras:
   
   # Example Camera 1: Parking Lot Entrance
   cam_001:
-    name: "Parking Lot Entrance"
+    name: "cam_001"
     ip: "192.168.120.33"
     rtsp_url: "rtsp://admin:vge2024211865@192.168.120.33:554/Streaming/Channels/101"
     # FTP directory where camera uploads alarm images
     # On Windows, use forward slashes or double backslashes
-    ftp_image_dir: "D:/FTP"  # Where FTP uploads alarm images
+    ftp_image_dir: "D:/FTP/cam_001"  # Where FTP uploads alarm images
+    event_type: "line_crossing"                   # Event type
+    enabled: true
+    
+    # Recording parameters (in seconds)
+    pre_seconds: 5                                 # Record 5 seconds before alarm
+    post_seconds: 10                               # Record 10 seconds after alarm
+    cache_seconds: 120                             # Keep 120 seconds of circular buffer
+    cooldown_seconds: 3                            # Minimum interval between repeated alarms
+    max_extend_seconds: 60                         # Max extension for continued recording
+    
+    # Output directory (if not set, uses base_video_dir)
+    output_dir: "./data/video/cam_001"
+
+      # Example Camera 1: Parking Lot Entrance
+  cam_002:
+    name: "cam_002"
+    ip: "192.168.120.35"
+    rtsp_url: "rtsp://admin:vge2024211865@192.168.120.35:554/Streaming/Channels/101"
+    # FTP directory where camera uploads alarm images
+    # On Windows, use forward slashes or double backslashes
+    ftp_image_dir: "D:/FTP/cam_002"  # Where FTP uploads alarm images
     event_type: "line_crossing"                   # Event type
     enabled: true
     
