@@ -93,6 +93,7 @@ class EventSystem:
             self.config.ffmpeg_path,
             analysis_mode=self.config.analysis_mode,
             save_annotated_images=self.config.save_annotated_images,
+            camera_configs=self.config.cameras,
         )
         self.scheduler = EventScheduler(
             self.db,
@@ -279,10 +280,47 @@ class EventSystem:
         if event_record.analysis_result:
             analysis_status = event_record.analysis_result.get("status")
             self.logger.info(f"Analysis result status: {analysis_status}")
+
+            final_result = event_record.analysis_result.get("final_result") or {}
+            if final_result:
+                self.logger.info(
+                    "Final alarm result: is_alarm=%s risk=%s title=%s action=%s reason=%s needs_review=%s",
+                    final_result.get("is_alarm"),
+                    final_result.get("risk_level"),
+                    final_result.get("alarm_title"),
+                    final_result.get("recommended_action"),
+                    final_result.get("alarm_reason"),
+                    final_result.get("needs_review"),
+                )
+
+            llm_review = (
+                event_record.analysis_result.get("llm_review")
+                or event_record.analysis_result.get("vlm_result")
+                or {}
+            )
+            if llm_review:
+                self.logger.info(
+                    "LLM/VLM review result: enabled=%s mode=%s provider=%s model=%s api=%s valid=%s risk=%s target=%s behavior=%s confidence=%s reason=%s false_alarm_reason=%s note=%s",
+                    llm_review.get("enabled"),
+                    llm_review.get("mode"),
+                    llm_review.get("provider"),
+                    llm_review.get("model"),
+                    llm_review.get("api"),
+                    llm_review.get("is_valid_alarm"),
+                    llm_review.get("risk_level"),
+                    llm_review.get("target_type"),
+                    llm_review.get("behavior"),
+                    llm_review.get("confidence"),
+                    llm_review.get("reason"),
+                    llm_review.get("false_alarm_reason"),
+                    llm_review.get("note"),
+                )
+
+            # Backward compatibility with the old analyzer format.
             vlm_analysis = event_record.analysis_result.get("vlm_analysis") or {}
             vlm_answer = vlm_analysis.get("answer")
             if vlm_answer:
-                self.logger.info(f"VLM result: {vlm_answer[:300]}")
+                self.logger.info(f"VLM raw answer: {vlm_answer[:300]}")
     
     def _signal_handler(self, signum, frame) -> None:
         """Handle shutdown signals."""
@@ -340,7 +378,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     system = EventSystem(
         config_path=args.config,
         log_level=args.log_level,
-        enable_api=not args.no_api,
+        enable_api=False if args.no_api else None,
         analysis_mode=args.analysis_mode,
     )
 

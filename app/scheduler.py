@@ -12,6 +12,7 @@ from typing import Callable, Dict, Optional
 from .models import AlarmEvent, ActiveEvent, CameraConfig, EventRecord, EventStatus
 from .database import EventDatabase
 from .event_finalizer import EventFinalizer
+from .analysis.event_analyzer import EventAnalyzer
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ class EventScheduler:
         self.cache_dir = cache_dir
         self.output_dir = output_dir
         self.analysis_mode = analysis_mode
+        self.event_analyzer = EventAnalyzer()
+        self.analysis_threads: dict[str, threading.Thread] = {}
         
         # Active events per camera: camera_id -> ActiveEvent
         self.active_events: Dict[str, ActiveEvent] = {}
@@ -135,7 +138,56 @@ class EventScheduler:
         
         if self.on_event_created:
             self.on_event_created(active_event)
+
+        # In image mode finalization happens immediately and performs the same
+        # analysis. Only pre-analyze in video mode to avoid duplicate YOLO/VLM
+        # calls and duplicate model loading.
+        if self.analysis_mode == "video":
+            self._start_image_analysis(active_event, camera_config)
     
+
+    def _start_image_analysis(self, active_event: ActiveEvent, camera_config: CameraConfig) -> None:
+        """Analyze the FTP alarm image in a background thread.
+
+        This keeps FTP watching and RTSP recording responsive while still making
+        image-level railway-security results available before event finalization.
+        """
+        if not active_event.image_path:
+            return
+        thread_key = f"analysis_{active_event.camera_id}_{active_event.alarm_time.timestamp()}"
+        existing = self.analysis_threads.get(thread_key)
+        if existing and existing.is_alive():
+            return
+
+        def _worker() -> None:
+            try:
+                result = self.event_analyzer.analyze_image(
+                    image_path=active_event.image_path or "",
+                    camera_id=active_event.camera_id,
+                    event_time=active_event.alarm_time,
+                    camera_config=camera_config,
+                )
+                with self.lock:
+                    current = self.active_events.get(active_event.camera_id)
+                    if current is active_event:
+                        current.analysis_result = result
+                logger.info(
+                    "Initial railway image analysis finished for %s: %s",
+                    active_event.camera_id,
+                    (result.get("final_result") or {}).get("risk_level"),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Initial railway image analysis failed for %s: %s",
+                    active_event.camera_id,
+                    exc,
+                    exc_info=True,
+                )
+
+        thread = threading.Thread(target=_worker, daemon=True, name=thread_key)
+        thread.start()
+        self.analysis_threads[thread_key] = thread
+
     def _extend_event(
         self,
         active_event: ActiveEvent,

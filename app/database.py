@@ -82,37 +82,88 @@ class EventDatabase:
         logger.info("Database initialized at %s", self.db_path)
 
     def add_event(self, event: EventRecord) -> int:
-        """Add a new event record."""
+        """Add a new event record or update the existing same camera/start event.
+
+        Replaying the same FTP image or restarting the demo can produce the same
+        ``(camera_id, event_start_time)``. Instead of failing on the UNIQUE
+        constraint, treat it as an idempotent upsert and refresh the analysis
+        result/paths.
+        """
         conn = self._connect()
         cursor = conn.cursor()
+        analysis_json = json.dumps(event.analysis_result, ensure_ascii=False) if event.analysis_result is not None else None
         try:
-            cursor.execute(
-                """
-                INSERT INTO events (
-                    camera_id, media_type, event_type, event_time, event_start_time,
-                    event_end_time, image_path, video_path, annotated_image_path,
-                    analysis_result, status, alarm_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO events (
+                        camera_id, media_type, event_type, event_time, event_start_time,
+                        event_end_time, image_path, video_path, annotated_image_path,
+                        analysis_result, status, alarm_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.camera_id,
+                        event.media_type,
+                        event.event_type,
+                        event.event_time.isoformat(),
+                        event.event_start_time.isoformat(),
+                        event.event_end_time.isoformat(),
+                        event.image_path,
+                        event.video_path,
+                        event.annotated_image_path,
+                        analysis_json,
+                        event.status,
+                        event.alarm_count,
+                        event.created_at.isoformat(),
+                        event.updated_at.isoformat(),
+                    ),
+                )
+                conn.commit()
+                return int(cursor.lastrowid)
+            except sqlite3.IntegrityError:
+                cursor.execute(
+                    """
+                    SELECT id FROM events
+                    WHERE camera_id=? AND event_start_time=?
+                    """,
+                    (event.camera_id, event.event_start_time.isoformat()),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    raise
+                event_id = int(row["id"])
+                cursor.execute(
+                    """
+                    UPDATE events SET
+                        media_type=?, event_type=?, event_time=?, event_end_time=?,
+                        image_path=?, video_path=?, annotated_image_path=?,
+                        analysis_result=?, status=?, alarm_count=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        event.media_type,
+                        event.event_type,
+                        event.event_time.isoformat(),
+                        event.event_end_time.isoformat(),
+                        event.image_path,
+                        event.video_path,
+                        event.annotated_image_path,
+                        analysis_json,
+                        event.status,
+                        event.alarm_count,
+                        event.updated_at.isoformat(),
+                        event_id,
+                    ),
+                )
+                conn.commit()
+                logger.info(
+                    "Updated existing event id=%s for camera=%s start=%s",
+                    event_id,
                     event.camera_id,
-                    event.media_type,
-                    event.event_type,
-                    event.event_time.isoformat(),
                     event.event_start_time.isoformat(),
-                    event.event_end_time.isoformat(),
-                    event.image_path,
-                    event.video_path,
-                    event.annotated_image_path,
-                    json.dumps(event.analysis_result) if event.analysis_result is not None else None,
-                    event.status,
-                    event.alarm_count,
-                    event.created_at.isoformat(),
-                    event.updated_at.isoformat(),
-                ),
-            )
-            conn.commit()
-            return cursor.lastrowid
+                )
+                return event_id
         finally:
             conn.close()
 

@@ -1,9 +1,9 @@
-"""
+﻿"""
 Data models for the multi-camera event recording system.
 """
 
 from enum import Enum
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,7 @@ class CameraConfig(BaseModel):
     max_extend_seconds: int = Field(default=60, description="Max extension for continued recording")
     output_dir: str = Field(..., description="Directory to save event videos")
     enabled: bool = Field(default=True, description="Whether this camera is enabled")
+    railway_security: dict[str, Any] = Field(default_factory=dict, description="Railway perimeter analysis settings")
 
 
 class AlarmEvent(BaseModel):
@@ -96,10 +97,12 @@ class SystemConfig(BaseModel):
     ffmpeg_path: str = "ffmpeg"
     scheduler_interval_sec: float = 1.0  # Check for finalization events every N seconds
     file_cleanup_interval_sec: float = 30.0  # Run cache cleanup every N seconds
-    enable_api: bool = False
+    enable_api: bool = True
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
     class Config:
         """Pydantic config."""
         arbitrary_types_allowed = True
+
+

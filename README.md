@@ -1,162 +1,128 @@
-# Multi-Camera Event Recording System / 多摄像头事件检测与录像系统
+# Multi-Camera Railway Perimeter Event System / 多摄像头铁路周界事件系统
 
-A multi-camera event detection and recording system. It monitors FTP alarm image folders for each camera, creates event records when alarms are triggered, and can output event videos, YOLO annotated results, and Qwen-VL multimodal analysis results.
+A Python demo for multi-camera railway perimeter intrusion recording and intelligent alarm review.
 
-多摄像头事件检测与录像系统。系统监听每路摄像机的 FTP 报警图片目录，在触发报警后自动生成事件记录，并可根据配置输出事件视频、YOLO 标注结果以及 Qwen-VL 多模态分析结果。
+一个用于铁路周界入侵录像与智能报警复核的 Python Demo。
 
-## Features / 功能概览
+The system keeps the original capabilities:
 
-- Multi-camera support: each camera has independent RTSP, FTP alarm folder, and recording parameters.  
-  多摄像机接入：每路摄像机独立配置 RTSP、FTP 报警目录和录像参数。
-- Two analysis modes:  
-  两种分析模式：
-  - `video`: continuously captures RTSP streams into circular TS caches, then composes an MP4 containing pre-alarm and post-alarm footage.  
-    `video`：持续拉取 RTSP，保存环形 TS 缓存；报警后合成包含报警前后片段的 MP4。
-  - `image`: skips RTSP recording and analyzes FTP alarm images only.  
-    `image`：不启动 RTSP 录像，仅分析 FTP 上传的报警图片。
-- Smart event merging: repeated alarms from the same camera can extend the current event window.  
-  智能事件合并：同一摄像机在 `post_seconds` 窗口内再次报警时自动延长事件。
-- YOLO person detection for images or composed videos.  
-  YOLO 人员检测：对图片或合成视频执行人员检测。
-- Qwen-VL analysis through DashScope multimodal models.  
-  Qwen-VL 分析：通过 DashScope 多模态模型生成异常事件文字分析。
-- SQLite event database for metadata and analysis results.  
-  SQLite 事件库：记录事件时间、图片/视频路径、分析结果、状态等元数据。
-- Optional REST API for health checks, camera status, and event queries.  
-  可选 REST API：提供健康检查、摄像机状态、事件列表和事件详情接口。
-- Windows-friendly scripts and configuration templates.  
-  Windows 友好：提供 `.bat`、`.ps1` 启动脚本和 Windows 配置模板。
+系统保留原有能力：
 
-## Workflow / 工作流程
+- RTSP continuous capture with FFmpeg circular cache / 基于 FFmpeg 的 RTSP 循环缓存
+- FTP alarm image trigger from Hikvision cameras / 海康摄像机 FTP 报警图片触发
+- Pre-alarm and post-alarm event video generation / 报警前后事件视频生成
+- SQLite event persistence / SQLite 事件入库
+- FastAPI event query API / FastAPI 事件查询接口
+
+It also adds a railway-security review pipeline:
+
+同时新增铁路周界智能复核流程：
 
 ```text
-Camera RTSP / 摄像机 RTSP
-  └─ video mode / video 模式
-      └─ FFmpeg 1-second TS cache / FFmpeg 1 秒 TS 缓存
-
-FTP alarm image / FTP 报警图片
-  └─ watchdog listener / watchdog 监听
-      └─ alarm event / 报警事件
-          └─ scheduler / 事件调度器
-              ├─ video mode: compose MP4 / video 模式：合成 MP4
-              ├─ image mode: analyze image / image 模式：分析图片
-              └─ YOLO + Qwen-VL analysis / YOLO + Qwen-VL 分析
-                  └─ SQLite database / SQLite 数据库
+RTSP cache / RTSP 缓存
+  -> FTP alarm / FTP 报警
+  -> YOLO detection / YOLO 目标初筛
+  -> region rules / 区域规则
+  -> Qwen-VL or mock VLM review / Qwen-VL 或 mock 多模态复核
+  -> graded alarm explanation / 分级报警解释
+  -> SQLite + FastAPI / SQLite 与 API 展示
 ```
+
+## Features / 功能
+
+- Multi-camera configuration / 多摄像机配置
+- `video` mode: cache RTSP and compose alarm video / `video` 模式：缓存 RTSP 并合成报警视频
+- `image` mode: analyze FTP alarm images only / `image` 模式：仅分析 FTP 报警图片
+- YOLO detection for `person`, `vehicle`, and COCO animal classes / YOLO 检测人员、车辆和 COCO 动物类别
+- Railway warning/danger zone rules / 铁路警戒区、危险区规则
+- Fence-line crossing heuristic / 护网跨越启发式判断
+- DashScope/Qwen-VL review with offline mock fallback / DashScope/Qwen-VL 复核，并支持离线 mock 降级
+- Structured `analysis_result` saved to SQLite and returned by API / 结构化 `analysis_result` 入库并由 API 返回
+- Demo scripts for image and event review / 图片与事件复核 Demo 脚本
 
 ## Project Structure / 目录结构
 
 ```text
 multi_camera_event_system/
-├─ app/                    # Application modules / 主程序模块
-│  ├─ main.py              # Entry point / 程序入口
-│  ├─ config.py            # YAML config loader / YAML 配置加载
-│  ├─ recorder.py          # RTSP/FFmpeg cache recorder / RTSP/FFmpeg 缓存录像
-│  ├─ event_listener.py    # FTP image folder listener / FTP 图片目录监听
-│  ├─ scheduler.py         # Event state machine / 事件状态机
-│  ├─ event_finalizer.py   # Video composition and finalization / 视频合成与事件收尾
-│  ├─ ftp_image_detector.py# YOLO + DashScope/Qwen-VL analysis / YOLO + Qwen-VL 分析
-│  ├─ database.py          # SQLite database access / SQLite 数据库访问
-│  └─ api.py               # FastAPI REST API / FastAPI 接口
+├─ app/
+│  ├─ analysis/
+│  │  ├─ yolo_detector.py      # YOLO wrapper / YOLO 封装
+│  │  ├─ region_rules.py       # Railway region rules / 铁路区域规则
+│  │  ├─ vlm_reviewer.py       # Qwen-VL/mock review / 多模态复核
+│  │  ├─ frame_sampler.py      # Key-frame sampling / 关键帧抽取
+│  │  └─ event_analyzer.py     # Unified analysis pipeline / 统一分析入口
+│  ├─ main.py
+│  ├─ scheduler.py
+│  ├─ event_finalizer.py
+│  ├─ event_listener.py
+│  ├─ recorder.py
+│  ├─ database.py
+│  └─ api.py
 ├─ configs/
-│  ├─ cameras.windows.yaml # Windows config template / Windows 配置模板
-│  └─ cameras.yaml         # Runtime config / 实际运行配置
+│  ├─ cameras.example.yaml
+│  ├─ cameras.windows.yaml
+│  └─ cameras.yaml
 ├─ scripts/
-│  ├─ run.bat              # Windows CMD launcher / Windows CMD 启动脚本
-│  ├─ run.ps1              # Windows PowerShell launcher / PowerShell 启动脚本
-│  └─ run.sh               # Linux/macOS launcher / Linux/macOS 启动脚本
+│  ├─ run.bat
+│  ├─ run.ps1
+│  ├─ run.sh
+│  ├─ demo_analyze_image.py
+│  └─ demo_analyze_event.py
 ├─ data/
-│  ├─ cache/               # TS circular cache / TS 环形缓存
-│  ├─ video/               # Event videos and annotated outputs / 事件视频与标注结果
-│  ├─ db/                  # SQLite database / SQLite 数据库
-│  └─ logs/                # Logs / 日志
 ├─ requirements.txt
-├─ yolov8n.pt              # YOLO weights / YOLO 权重
+├─ yolov8n.pt
 └─ README.md
 ```
 
 ## Requirements / 环境要求
 
 - Python 3.11+
-- FFmpeg 4.2+; required for `video` mode.  
-  FFmpeg 4.2+；`video` 模式必需。
-- Network access to camera RTSP streams and FTP alarm image folders.  
-  可访问摄像机 RTSP 地址和 FTP 报警图片目录。
-- DashScope API Key if Qwen-VL analysis is required.  
-  如需 Qwen-VL 分析，需要 DashScope API Key。
-- Recommended OS: Windows 10/11 or Ubuntu 20.04+.  
-  推荐系统：Windows 10/11 或 Ubuntu 20.04+。
+- FFmpeg 4.2+ for `video` mode / `video` 模式需要 FFmpeg 4.2+
+- Optional: DashScope API key for real Qwen-VL review / 可选：DashScope API Key 用于真实 Qwen-VL 复核
+- Windows 10/11 or Linux / Windows 10/11 或 Linux
 
-## Installation / 安装
+Install dependencies:
 
-### Windows
-
-```powershell
-cd multi_camera_event_system
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-ffmpeg -version
-```
-
-You can also run the setup wizard:  
-也可以运行初始化脚本：
-
-```cmd
-scripts\setup-windows.bat
-```
-
-### Linux / macOS
+安装依赖：
 
 ```bash
 cd multi_camera_event_system
-python3 -m venv venv
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# Linux/macOS:
 source venv/bin/activate
 pip install -r requirements.txt
-ffmpeg -version
 ```
 
 ## Configuration / 配置
 
-Copy the template:  
-复制配置模板：
+Copy the template:
 
-```powershell
-copy configs\cameras.windows.yaml configs\cameras.yaml
-```
-
-Linux/macOS:
+复制模板：
 
 ```bash
-cp configs/cameras.windows.yaml configs/cameras.yaml
+cp configs/cameras.example.yaml configs/cameras.yaml
 ```
 
-Edit `configs/cameras.yaml`:  
-编辑 `configs/cameras.yaml`：
+Windows CMD:
+
+```cmd
+copy configs\cameras.example.yaml configs\cameras.yaml
+```
+
+Basic camera settings:
+
+基础摄像机配置：
 
 ```yaml
-system:
-  analysis_mode: "video"          # video | image
-  save_annotated_images: true      # save YOLO annotated images in image mode
-  base_cache_dir: "./data/cache"
-  base_video_dir: "./data/video"
-  db_path: "./data/db/events.db"
-  log_dir: "./data/logs"
-  ffmpeg_path: "ffmpeg"
-  log_level: "INFO"
-  scheduler_interval_sec: 1.0
-  file_cleanup_interval_sec: 30.0
-  enable_api: false
-  api_host: "0.0.0.0"
-  api_port: 8000
-
 cameras:
   cam_001:
-    name: "Camera 001"
+    name: "Railway Perimeter Camera 001"
     ip: "192.168.1.100"
     rtsp_url: "rtsp://admin:password@192.168.1.100:554/Streaming/Channels/101"
-    ftp_image_dir: "D:/FTP/cam_001"
-    event_type: "line_crossing"
+    ftp_image_dir: "./data/ftp/cam_001"
+    event_type: "intrusion"
     enabled: true
     pre_seconds: 5
     post_seconds: 10
@@ -166,212 +132,232 @@ cameras:
     output_dir: "./data/video/cam_001"
 ```
 
-### Key Options / 常用配置说明
+### railway_security / 铁路周界智能复核配置
 
-| Field / 字段 | Description / 说明 |
-| --- | --- |
-| `analysis_mode` | `video` caches RTSP and creates MP4; `image` analyzes FTP images only. / `video` 会缓存 RTSP 并生成 MP4；`image` 只分析 FTP 图片。 |
-| `ftp_image_dir` | Local folder where the camera uploads alarm images. / 摄像机报警图片上传到本机的目录。 |
-| `pre_seconds` | Seconds before the alarm to include in event video; only for `video` mode. / 事件视频包含报警前多少秒，仅 `video` 模式有效。 |
-| `post_seconds` | Seconds to keep recording/waiting after the alarm. / 报警后继续等待或录像多少秒。 |
-| `cache_seconds` | Circular cache duration; should be greater than `pre_seconds + post_seconds`. / 环形缓存时长，建议大于 `pre_seconds + post_seconds`。 |
-| `cooldown_seconds` | Debounce interval for repeated alarms from the same camera. / 同一摄像机报警去抖间隔。 |
-| `max_extend_seconds` | Maximum duration that one event can be extended. / 单个事件允许被连续报警延长的最大时长。 |
+Add `railway_security` under each camera:
 
-For Windows YAML paths, use `/` or double backslashes `\\`:  
-Windows YAML 路径建议使用 `/` 或双反斜杠 `\\`：
+在每个摄像机下增加 `railway_security`：
 
 ```yaml
-ftp_image_dir: "D:/FTP/cam_001"      # recommended / 推荐
-ftp_image_dir: "D:\\FTP\\cam_001"    # also valid / 也可以
+railway_security:
+  enabled: true
+  scene_type: "railway_perimeter"
+  yolo:
+    enabled: true
+    model_path: "yolov8n.pt"
+    conf_threshold: 0.35
+    target_classes:
+      - person
+      - car
+      - truck
+      - bus
+      - motorcycle
+      - bicycle
+      - dog
+      - cat
+      - horse
+      - cow
+      - sheep
+  regions:
+    image_size: [1920, 1080]
+    fence_line:
+      - [100, 620]
+      - [1800, 610]
+    warning_zone:
+      - [80, 500]
+      - [1850, 500]
+      - [1900, 760]
+      - [60, 760]
+    danger_zone:
+      - [150, 620]
+      - [1800, 620]
+      - [1860, 900]
+      - [120, 900]
+  risk_rules:
+    min_persist_frames: 2
+    low_risk: "目标在警戒区外经过"
+    medium_risk: "目标靠近护网或进入警戒区"
+    high_risk: "目标越过护网、进入危险区或向轨道方向移动"
+  vlm:
+    enabled: true
+    provider: "dashscope"
+    model: "qwen-vl-plus"
+    timeout_sec: 20
+    mock_when_no_key: true
 ```
 
-## DashScope / Qwen-VL
+`warning_zone` and `danger_zone` are polygons in image coordinates. `fence_line` is used to infer possible fence crossing. The system does not raise an alarm only because a person is detected; it combines target class, confidence, zone, and fence relationship.
 
-Create `.env` in the project root if multimodal analysis is required:  
-如需多模态分析，在项目根目录创建 `.env`：
+`warning_zone` 和 `danger_zone` 是图像坐标多边形。`fence_line` 用于判断疑似跨越护网。系统不会因为“检测到人”就直接报警，而是结合目标类别、置信度、区域位置和护网关系进行判断。
+
+## DashScope and Offline Mock / DashScope 与离线 Mock
+
+For real Qwen-VL review, create `.env`:
+
+如需真实 Qwen-VL 复核，在项目根目录创建 `.env`：
 
 ```env
 DASHSCOPE_API_KEY=your_dashscope_api_key_here
 ```
 
-If the API key is missing, YOLO can still run, but Qwen-VL analysis will return an error or partial-success status.  
-未配置 API Key 时，YOLO 仍可执行，但 Qwen-VL 分析会返回错误或部分成功状态。
+If no API key is configured, or DashScope/network is unavailable, the system automatically uses mock VLM review based on region rules.
+
+如果未配置 API Key，或 DashScope/网络不可用，系统会自动使用基于区域规则的 mock 多模态复核，保证 Demo 可离线运行。
 
 ## Running / 运行
 
-### PowerShell
+Windows PowerShell:
 
 ```powershell
 .\scripts\run.ps1 -ConfigFile "configs\cameras.yaml" -LogLevel "INFO"
 .\scripts\run.ps1 -ConfigFile "configs\cameras.yaml" -LogLevel "INFO" -AnalysisMode image
 ```
 
-### CMD
+Windows CMD:
 
 ```cmd
 scripts\run.bat configs\cameras.yaml INFO video
 scripts\run.bat configs\cameras.yaml INFO image
 ```
 
-### Python
+Python:
 
 ```bash
 python -m app.main -c configs/cameras.yaml -l INFO --analysis-mode video
 python -m app.main -c configs/cameras.yaml -l INFO --analysis-mode image
 ```
 
-Disable REST API:  
-不启用 REST API：
+## Demo Commands / Demo 命令
+
+Analyze one alarm image:
+
+分析单张报警图片：
 
 ```bash
-python -m app.main -c configs/cameras.yaml -l INFO --no-api
+python scripts/demo_analyze_image.py --image data/ftp/cam_001/alarm.jpg --camera-id cam_001 --config configs/cameras.yaml
 ```
 
-## Test an Alarm / 测试报警
+Save visualization:
 
-Put an image into one camera's `ftp_image_dir` to trigger an event.  
-向某一路摄像机的 `ftp_image_dir` 放入一张图片即可触发事件。
-
-```powershell
-python -c "from pathlib import Path; from PIL import Image; out=Path('D:/FTP/cam_001'); out.mkdir(parents=True, exist_ok=True); Image.new('RGB',(1280,720),'blue').save(out/'alarm_test.jpg')"
-```
-
-View logs:  
-查看日志：
-
-```powershell
-Get-Content .\data\logs\event_system.log -Wait
-```
-
-## Outputs / 输出结果
-
-- SQLite database: `data/db/events.db`  
-  SQLite 数据库：`data/db/events.db`
-- Log file: `data/logs/event_system.log`  
-  日志文件：`data/logs/event_system.log`
-- Event video in `video` mode:  
-  `video` 模式事件视频：
-
-```text
-data/video/{camera_id}/{YYYY-MM-DD}/event_{camera_id}_{YYYYMMDD_HHMMSS}.mp4
-```
-
-- YOLO annotated video in `video` mode: usually `*_yolo.mp4` in the same folder.  
-  `video` 模式 YOLO 标注视频：通常为同目录下的 `*_yolo.mp4`。
-- YOLO annotated image in `image` mode: usually `*_yolo.jpg/png`.  
-  `image` 模式 YOLO 标注图片：通常为 `*_yolo.jpg/png`。
-
-## Query Database / 查询数据库
+保存检测框、区域和风险等级可视化图片：
 
 ```bash
-sqlite3 data/db/events.db "SELECT id,camera_id,media_type,status,event_time,video_path,image_path FROM events ORDER BY event_time DESC LIMIT 20;"
+python scripts/demo_analyze_image.py --image data/ftp/cam_001/alarm.jpg --camera-id cam_001 --visualize data/demo_vis.jpg
+```
+
+Analyze a stored event:
+
+分析数据库事件：
+
+```bash
+python scripts/demo_analyze_event.py --event-id 1 --config configs/cameras.yaml
+```
+
+Analyze a video file:
+
+分析视频文件：
+
+```bash
+python scripts/demo_analyze_event.py --video data/video/cam_001/2026-05-28/event.mp4 --camera-id cam_001 --alarm-image data/ftp/cam_001/alarm.jpg
 ```
 
 ## REST API
 
-When enabled, the default base URL is `http://localhost:8000`.  
-启用 API 后默认地址为 `http://localhost:8000`。
+Enable API in config:
+
+在配置中启用 API：
+
+```yaml
+system:
+  enable_api: true
+  api_host: "0.0.0.0"
+  api_port: 8000
+```
+
+Endpoints:
+
+接口：
 
 | Endpoint / 接口 | Description / 说明 |
 | --- | --- |
 | `GET /health` | Health check / 健康检查 |
 | `GET /status` | System status / 系统状态 |
 | `GET /cameras` | Camera list / 摄像机列表 |
-| `GET /cameras/{camera_id}` | Camera details / 单路摄像机详情 |
-| `GET /events` | Event list; supports `camera_id` and `limit`. / 事件列表，支持 `camera_id`、`limit` 参数。 |
-| `GET /events/{event_id}` | Event details / 事件详情 |
-| `GET /events/active/all` | Active events / 当前活跃事件 |
-| `GET /health/recorders` | Recorder health / RTSP 录像器健康状态 |
+| `GET /events` | Event list with alarm summary / 事件列表，包含报警摘要 |
+| `GET /events/{id}` | Full event with `analysis_result` / 事件详情，包含完整复核结果 |
+| `GET /events/summary/stats` | Risk-level statistics / 风险等级统计 |
+| `GET /events/{id}/frames` | Key-frame paths / 关键帧路径 |
+| `GET /health/recorders` | Recorder health / 录像器健康状态 |
 
-Examples / 示例：
+Examples:
+
+示例：
 
 ```bash
-curl http://localhost:8000/status
-curl "http://localhost:8000/events?camera_id=cam_001&limit=20"
+curl http://localhost:8000/events
+curl http://localhost:8000/events/summary/stats
+curl http://localhost:8000/events/1/frames
 ```
 
-## Troubleshooting / 常见问题
+## analysis_result Example / analysis_result 示例
 
-### 1. `ffmpeg is not installed or not in PATH`
-
-Install FFmpeg and add it to PATH, or specify the full path in config.  
-安装 FFmpeg 并加入 PATH，或在配置中填写完整路径。
-
-```yaml
-ffmpeg_path: "C:/Program Files/ffmpeg/bin/ffmpeg.exe"
+```json
+{
+  "camera_id": "cam_001",
+  "event_time": "2026-05-28T10:00:00",
+  "pipeline_version": "railway_security_v1",
+  "detections": [
+    {
+      "class_name": "person",
+      "confidence": 0.82,
+      "bbox": [520, 430, 610, 710],
+      "center": [565, 570],
+      "zone": "warning",
+      "cross_fence": false
+    }
+  ],
+  "rule_result": {
+    "risk_level": "medium",
+    "risk_score": 0.56,
+    "reason": "人员进入警戒区"
+  },
+  "vlm_result": {
+    "enabled": true,
+    "is_valid_alarm": true,
+    "risk_level": "medium",
+    "target_type": "person",
+    "behavior": "approaching",
+    "reason": "人员靠近护网并进入警戒区域",
+    "confidence": 0.72,
+    "false_alarm_reason": ""
+  },
+  "final_result": {
+    "is_alarm": true,
+    "risk_level": "medium",
+    "alarm_title": "铁路周界疑似入侵",
+    "alarm_reason": "人员进入警戒区，建议现场核查",
+    "recommended_action": "现场核查",
+    "needs_review": false
+  }
+}
 ```
 
-### 2. Alarm images are uploaded, but no events are created / 摄像机报警图片上传了，但系统没有事件
+## Outputs / 输出
 
-Check the following:  
-检查以下项目：
+- Logs / 日志：`data/logs/event_system.log`
+- Database / 数据库：`data/db/events.db`
+- Event video / 事件视频：`data/video/{camera_id}/{YYYY-MM-DD}/event_*.mp4`
+- Key frames / 关键帧：`*_frames/`
+- Optional visualization / 可选可视化图：由 `--visualize` 指定
 
-- `ftp_image_dir` matches the real upload folder.  
-  `ftp_image_dir` 是否和实际上传目录一致。
-- Image extension is `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, or `.tiff`.  
-  图片扩展名是否为 `.jpg/.jpeg/.png/.bmp/.gif/.tiff`。
-- Camera is enabled with `enabled: true`.  
-  当前摄像机是否 `enabled: true`。
-- The event is not skipped by `cooldown_seconds`.  
-  是否处于 `cooldown_seconds` 去抖时间内。
-- Logs contain `Detected alarm event`.  
-  日志中是否有 `Detected alarm event`。
+## Notes / 注意事项
 
-### 3. `No ts files found` in video mode / video 模式提示 `No ts files found`
-
-Check the following:  
-检查以下项目：
-
-- RTSP URL, username, and password are correct.  
-  RTSP 地址、账号密码是否正确。
-- FFmpeg is writing files into `data/cache/{camera_id}`.  
-  FFmpeg 是否正在写入 `data/cache/{camera_id}`。
-- `cache_seconds > pre_seconds + post_seconds`.  
-  确认 `cache_seconds > pre_seconds + post_seconds`。
-- System time is accurate.  
-  系统时间是否准确。
-
-### 4. Qwen-VL analysis fails / Qwen-VL 分析失败
-
-Check `.env`:  
-检查 `.env`：
-
-```env
-DASHSCOPE_API_KEY=your_key
-```
-
-Also make sure the machine can access DashScope upload and inference APIs.  
-并确认机器可访问 DashScope 上传和推理接口。
-
-### 5. YAML path errors on Windows / Windows YAML 路径报错
-
-Do not use single backslashes:  
-不要使用单反斜杠：
-
-```yaml
-ftp_image_dir: "D:\FTP\cam_001"   # wrong in YAML double quotes / 错误示例
-```
-
-Use one of the following:  
-请使用以下写法：
-
-```yaml
-ftp_image_dir: "D:/FTP/cam_001"
-# or / 或
-ftp_image_dir: "D:\\FTP\\cam_001"
-```
-
-## Security Notes / 安全提示
-
-- Do not commit real camera credentials, internal IP addresses, or DashScope API keys.  
-  不要把真实摄像机账号、密码、内网地址、DashScope API Key 提交到 Git。
-- Keep real configuration in local `configs/cameras.yaml` and `.env`, and exclude them with `.gitignore`.  
-  建议将真实配置保存在本地 `configs/cameras.yaml` 和 `.env` 中，并通过 `.gitignore` 排除。
-- The REST API has no built-in authentication. Use firewall, VPN, or reverse-proxy authentication before exposing it.  
-  REST API 当前未做认证，如对外开放请使用防火墙、VPN 或反向代理鉴权。
+- Do not commit real camera passwords or API keys. / 不要提交真实摄像机密码或 API Key。
+- REST API has no built-in authentication. / REST API 当前未内置鉴权。
+- VLM is only called on alarm images or sampled frames, never on the real-time stream. / 大模型只处理报警图片或抽帧，不处理实时视频流。
+- If YOLO model or API key is missing, the system degrades gracefully. / 缺少 YOLO 模型或 API Key 时系统会降级运行。
 
 ## Version / 版本
 
-- README updated: 2026-05-28  
-  README 更新日期：2026-05-28
+- README updated: 2026-05-28
+- Pipeline version: `railway_security_v1`
