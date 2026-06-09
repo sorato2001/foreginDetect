@@ -1,12 +1,12 @@
 system:
-  analysis_mode: video
+  analysis_mode: "video"
   save_annotated_images: true
   base_cache_dir: ./data/cache
   base_video_dir: ./data/video
   db_path: ./data/db/events.db
   log_dir: ./data/logs
-  ffmpeg_path: ffmpeg
-  log_level: DEBUG
+  ffmpeg_path: "ffmpeg"
+  log_level: "DEBUG"
   scheduler_interval_sec: 1.0
   file_cleanup_interval_sec: 30.0
   enable_api: true
@@ -14,18 +14,19 @@ system:
   api_port: 8000
 cameras:
   cam_001:
-    name: cam_001
+    name: "Railway Perimeter Camera 001"
     ip: 192.168.120.33
-    rtsp_url: rtsp://admin:vge2024211865@192.168.120.33:554/Streaming/Channels/101
+    rtsp_url: "rtsp://admin:vge2024211865@192.168.120.33:554/Streaming/Channels/101"
     ftp_image_dir: D:/FTP/cam_001
-    event_type: line_crossing
+    event_type: "intrusion"
     enabled: true
     pre_seconds: 5
     post_seconds: 10
     cache_seconds: 120
     cooldown_seconds: 3
     max_extend_seconds: 60
-    output_dir: ./data/video/cam_001
+    output_dir: "./data/video/cam_001"
+
     railway_security:
       enabled: true
       scene_type: railway_perimeter
@@ -83,25 +84,27 @@ cameras:
         model: qwen-vl-plus
         timeout_sec: 20
         mock_when_no_key: true
+
   cam_002:
-    name: cam_002
+    name: "Railway Perimeter Camera 002"
     ip: 192.168.120.35
-    rtsp_url: rtsp://admin:vge2024211865@192.168.120.35:554/Streaming/Channels/101
-    ftp_image_dir: D:/FTP/cam_002
-    event_type: line_crossing
+    rtsp_url: "rtsp://admin:vge2024211865@192.168.120.35:554/Streaming/Channels/101"
+    ftp_image_dir: "D:/FTP/cam_002"
+    event_type: "intrusion"
     enabled: true
     pre_seconds: 5
     post_seconds: 10
     cache_seconds: 120
     cooldown_seconds: 3
     max_extend_seconds: 60
-    output_dir: ./data/video/cam_002
+    output_dir: "./data/video/cam_002"
+    
     railway_security:
       enabled: true
-      scene_type: railway_perimeter
+      scene_type: "railway_perimeter"
       yolo:
         enabled: true
-        model_path: yolov8n.pt
+        model_path: "yolov8n.pt"
         conf_threshold: 0.35
         target_classes:
         - person
@@ -149,7 +152,7 @@ cameras:
         high_risk: "目标越过护网、进入危险区或向轨道方向移动"
       vlm:
         enabled: true
-        provider: dashscope
-        model: qwen-vl-plus
+        provider: "dashscope"
+        model: "qwen-vl-plus"
         timeout_sec: 20
         mock_when_no_key: true

@@ -1,0 +1,9 @@
+detector: yolo
+yolo_model_path: yolov8n.pt
+conf_threshold: 0.35
+tracker: simple_iou
+vlm_provider: mock
+qwen_model: qwen-vl-plus
+dashscope_api_key_env: DASHSCOPE_API_KEY
+timeout_sec: 20
+

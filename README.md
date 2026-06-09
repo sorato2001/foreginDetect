@@ -361,3 +361,67 @@ curl http://localhost:8000/events/1/frames
 
 - README updated: 2026-05-28
 - Pipeline version: `railway_security_v1`
+
+## STEAD Research Prototype / STEAD 研究型原型
+
+foreginDetect is evolving into a structured temporal evidence driven
+surveillance anomaly detection prototype.
+
+本项目正在从“多摄像头事件录像 + YOLO/Qwen 复核 demo”升级为
+STEAD（Structured Temporal Evidence-guided Anomaly Detection，结构化时序证据驱动的监控异常检测与分级报警框架）。
+
+新增 `src/` 目录作为兼容式研究层，不删除旧的 `app/` RTSP、FTP、SQLite、FastAPI 功能。
+
+STEAD pipeline:
+
+```text
+event video/image
+  -> detector adapter
+  -> tracker adapter
+  -> ROI/rule engine
+  -> keyframes + temporal windows
+  -> event_evidence.json
+  -> Qwen or mock VLM review
+  -> alarm_result.json
+```
+
+Quick mock demo:
+
+```bash
+python -m src.pipeline.analyze_event \
+  --video examples/demo.mp4 \
+  --camera-id cam01 \
+  --rules configs/rules.example.yaml \
+  --output outputs/demo \
+  --vlm-provider mock \
+  --mock-detections
+```
+
+Outputs:
+
+```text
+outputs/demo/event_evidence.json
+outputs/demo/vlm_review.json
+outputs/demo/alarm_result.json
+```
+
+Run the STEAD API:
+
+```bash
+uvicorn src.api.main:app --host 0.0.0.0 --port 8010
+```
+
+Configure Qwen/DashScope:
+
+```bash
+copy .env.example .env
+```
+
+Then set `DASHSCOPE_API_KEY` in `.env`. Do not commit `.env`, API keys, RTSP
+passwords, or camera accounts. If secrets were ever committed or shared, rotate
+them before deployment.
+
+ROI/rule examples are in `configs/rules.example.yaml`; model/provider examples
+are in `configs/model.example.yaml`. More design notes are in
+`docs/STEAD_DESIGN.md`, API docs in `docs/API.md`, and experiment planning in
+`docs/EXPERIMENT_PLAN.md`.
