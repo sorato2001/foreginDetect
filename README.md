@@ -32,6 +32,15 @@ event video frames
   -> STEAD ROI/rule/VLM/alarm fusion
 ```
 
+Branch `STEAD_SAM2` embeds the RailwayIntrusion_Tracking_SAM2 method inside
+STEAD's detector/tracker path:
+
+- detector adapter: YOLO11l person/cow/sheep detection
+- track-region detector: `best.pt` railway/track segmentation
+- tracker adapter: SAM2 video predictor with streaming memory
+- temporal smoothing: optical-flow guided probability fusion
+- rule source: mask-IoU plus object-overlap intrusion judgment and sliding-window confirmation
+
 When SAMTracking produces a railway/track mask, STEP 04 uses mask-IoU
 intrusion judgment as the rule source:
 
@@ -79,7 +88,27 @@ venv\Scripts\activate
 # Linux/macOS
 source venv/bin/activate
 
+# CUDA 13.0
+pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+
+# CUDA 11.8
+pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu118
+
+# CUDA 12.1
+pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cu121
+
+# CPU only
+pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cpu
+
 pip install -r requirements.txt
+
+# SAM2 Installation
+cd ..
+git clone https://github.com/facebookresearch/sam2.git
+cd sam2
+pip install -e .
+
+cd ../RailwayIntrusion_Tracking_SAM2
 ```
 
 Python 3.10+ is recommended.
@@ -277,6 +306,9 @@ Useful CLI switches:
 --sam-track-model <path-to-best.pt>
 --sam2-config <path-to-sam2-config.yaml>
 --sam2-checkpoint <path-to-sam2-checkpoint.pt>
+--sam2-enabled true
+--sam2-scan-frames 30
+--sam2-prompt-mode bounding_box
 --sam-iou-threshold 0.10
 --sam-object-overlap-threshold 0.15
 --sam-window-size 5
@@ -341,10 +373,13 @@ Do not commit `.env`, API keys, camera accounts, RTSP passwords, private videos,
 database files, or generated outputs. If a secret was ever committed in another
 branch or shared externally, rotate it before deployment.
 
-##
+
+# COMMAND
 
 ```bash
  python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda 
 
  python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
+
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300 
  ```

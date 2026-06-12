@@ -28,6 +28,43 @@ from src.perception.simple_iou_tracker import SimpleIOUTracker
 logger = logging.getLogger(__name__)
 
 
+def _box_iou(box_a: Any, box_b: Any) -> float:
+    """Compute IoU for two xyxy boxes."""
+    try:
+        import numpy as np
+    except Exception:
+        return 0.0
+    a = np.asarray(box_a, dtype=float)
+    b = np.asarray(box_b, dtype=float)
+    xa, ya = max(a[0], b[0]), max(a[1], b[1])
+    xb, yb = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, xb - xa) * max(0.0, yb - ya)
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    denom = area_a + area_b - inter
+    return float(inter / denom) if denom > 0 else 0.0
+
+
+def det_to_track_id(det: Detection, tracks: dict[int, list[Detection]]) -> int | None:
+    """Find the current track id for a detection."""
+    for track_id, history in tracks.items():
+        if not history:
+            continue
+        last = history[-1]
+        if last.frame_index == det.frame_index and last.label == det.label and last.bbox == det.bbox:
+            return track_id
+    best_id: int | None = None
+    best_score = 0.0
+    for track_id, history in tracks.items():
+        if not history or history[-1].label != det.label:
+            continue
+        score = _box_iou(det.bbox, history[-1].bbox)
+        if score > best_score:
+            best_score = score
+            best_id = track_id
+    return best_id
+
+
 @dataclass(slots=True)
 class SAMTrackingConfig:
     """Configuration for the optional SAMTracking adapter."""
@@ -45,6 +82,10 @@ class SAMTrackingConfig:
     confirm_count: int = 3
     use_optical_flow: bool = True
     fallback_to_bbox_mask: bool = True
+    sam2_enabled: bool = True
+    sam2_scan_frames: int = 30
+    sam2_prompt_mode: str = "bounding_box"
+    sam2_new_object_iou_threshold: float = 0.3
     sample_every: int = 15
     track_mask_interval: int = 30
     imgsz: int = 640
@@ -212,7 +253,8 @@ class SAMTrackingAdapter:
         self._track_model_error: str | None = None
         self._sam2_error: str | None = None
         self._runtime_device = self._resolve_device(self.config.device)
-        self._smoother = _OpticalFlowMaskSmoother(enabled=self.config.use_optical_flow)
+        self._sam2_tracker: _SAM2VideoMemoryTracker | None = None
+        self._smoothers: dict[int, _OpticalFlowProbabilitySmoother] = {}
         self._load_models()
 
     def analyze_video(self, video_path: str, max_frames: int | None = 900) -> SAMTrackingResult:
@@ -259,6 +301,8 @@ class SAMTrackingAdapter:
         track_mask_seen = False
         detection_seen = False
         cached_track_mask: Any | None = None
+        if self.config.sam2_enabled:
+            self._initialize_sam2_video(video_path, fps, max_frames)
         logger.info(
             "SAMTracking analyze start: video=%s fps=%.3f total_frames=%s max_frames=%s sample_every=%s track_mask_interval=%s track_mask_enabled=%s device=%s imgsz=%s",
             video_path,
@@ -290,9 +334,13 @@ class SAMTrackingAdapter:
                 cached_track_mask = self.detect_track_mask(frame)
             track_mask = cached_track_mask
             track_mask_seen = track_mask_seen or bool(track_mask is not None and np.asarray(track_mask).sum() > 0)
-            object_masks = self.segment_objects(frame, detections)
+            object_ids = [det_to_track_id(det, tracks) for det in detections]
+            object_masks = self.segment_objects(frame, detections, frame_index=frame_index, object_ids=object_ids)
             if self.config.use_optical_flow and object_masks:
-                object_masks = [self._smoother.smooth(frame, mask) for mask in object_masks]
+                object_masks = [
+                    self._smooth_object_mask(frame, mask, object_ids[index] if index < len(object_ids) else index)
+                    for index, mask in enumerate(object_masks)
+                ]
             if track_mask is not None:
                 max_iou = max((judge.compute_iou(mask, track_mask) for mask in object_masks), default=0.0)
                 max_object_overlap = max((judge.compute_object_overlap(mask, track_mask) for mask in object_masks), default=0.0)
@@ -435,10 +483,28 @@ class SAMTrackingAdapter:
             logger.warning("SAMTracking track segmentation failed: %s", exc)
             return None
 
-    def segment_objects(self, frame: Any, detections: list[Detection]) -> list[Any]:
-        """Return object masks; falls back to bbox masks until SAM2 is configured."""
+    def segment_objects(
+        self,
+        frame: Any,
+        detections: list[Detection],
+        frame_index: int = 0,
+        object_ids: list[int | None] | None = None,
+    ) -> list[Any]:
+        """Return SAM2 object masks, falling back to bbox masks if needed."""
         if not detections:
             return []
+        if self._sam2_tracker is not None:
+            try:
+                masks, _scores, sam_object_ids = self._sam2_tracker.track_frame(
+                    frame_index,
+                    self._detections_to_prompts(detections),
+                )
+                if masks:
+                    return masks
+                logger.debug("SAM2 returned no masks at frame=%s ids=%s", frame_index, sam_object_ids)
+            except Exception as exc:
+                self._sam2_error = f"sam2_track_failed: {type(exc).__name__}: {exc}"
+                logger.warning("SAM2 tracking failed at frame=%s, fallback to bbox masks: %s", frame_index, exc)
         if self.config.fallback_to_bbox_mask:
             return [bbox_to_mask(frame.shape[:2], det.bbox) for det in detections]
         return []
@@ -476,13 +542,84 @@ class SAMTrackingAdapter:
 
     def _probe_sam2(self) -> str | None:
         """Check SAM2 availability without making it mandatory."""
-        if not self.config.sam2_config and not self.config.sam2_checkpoint:
+        if not self.config.sam2_enabled:
+            return "sam2_disabled"
+        if not self.config.sam2_config or not self.config.sam2_checkpoint:
             return "sam2_not_configured"
         try:
-            import sam2  # noqa: F401
+            from sam2.build_sam import build_sam2_video_predictor  # noqa: F401
         except Exception as exc:
             return f"sam2_unavailable: {exc}"
-        return "sam2_streaming_memory_not_initialized_in_adapter"
+        return None
+
+    def _initialize_sam2_video(self, video_path: str, fps: float, max_frames: int | None) -> None:
+        """Initialize SAM2 streaming memory tracker from first-frame YOLO prompts."""
+        if self._sam2_error is not None or not self.config.sam2_enabled:
+            return
+        if not self.config.sam2_config or not self.config.sam2_checkpoint:
+            self._sam2_error = "sam2_not_configured"
+            return
+        try:
+            scan_prompts = self._scan_initial_prompts(video_path, fps, max_frames)
+            tracker = _SAM2VideoMemoryTracker(
+                sam2_config=self.config.sam2_config,
+                sam2_checkpoint=self.config.sam2_checkpoint,
+                device=self._runtime_device,
+                prompt_mode=self.config.sam2_prompt_mode,
+                scan_frames=self.config.sam2_scan_frames,
+                new_obj_iou_thresh=self.config.sam2_new_object_iou_threshold,
+            )
+            tracker.initialize_video(video_path, scan_prompts=scan_prompts)
+            self._sam2_tracker = tracker
+            self._sam2_error = None
+            logger.info("SAM2 streaming memory tracker initialized: prompts=%s", len(scan_prompts))
+        except Exception as exc:
+            self._sam2_tracker = None
+            self._sam2_error = f"sam2_init_failed: {type(exc).__name__}: {exc}"
+            logger.warning("SAM2 initialization failed, fallback to bbox masks: %s", exc)
+
+    def _scan_initial_prompts(self, video_path: str, fps: float, max_frames: int | None) -> list[dict[str, Any]]:
+        """Scan initial frames with YOLO11l and convert boxes to SAM2 prompts."""
+        try:
+            import cv2
+        except Exception:
+            return []
+        scan_limit = self.config.sam2_scan_frames
+        if max_frames:
+            scan_limit = min(scan_limit, max_frames)
+        cap = cv2.VideoCapture(video_path)
+        prompts: list[dict[str, Any]] = []
+        frame_index = 0
+        while frame_index < scan_limit:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            timestamp = frame_index / fps if fps > 0 else 0.0
+            detections = self.detect_objects(frame, frame_index, timestamp)
+            prompts.append(self._detections_to_prompts(detections))
+            frame_index += 1
+        cap.release()
+        return prompts
+
+    @staticmethod
+    def _detections_to_prompts(detections: list[Detection]) -> dict[str, Any]:
+        """Convert STEAD detections to SAM2 box prompts."""
+        try:
+            import numpy as np
+        except Exception:
+            return {"boxes": [], "labels": [], "class_names": []}
+        if not detections:
+            return {"boxes": np.empty((0, 4)), "labels": np.empty((0,)), "class_names": []}
+        return {
+            "boxes": np.array([det.bbox for det in detections], dtype=np.float32),
+            "labels": np.arange(len(detections), dtype=np.int32),
+            "class_names": [det.label for det in detections],
+        }
+
+    def _smooth_object_mask(self, frame: Any, mask: Any, object_id: int | None) -> Any:
+        key = int(object_id if object_id is not None else -1)
+        smoother = self._smoothers.setdefault(key, _OpticalFlowProbabilitySmoother(enabled=True))
+        return smoother.smooth_mask(frame, mask)
 
     def _metadata(self, degraded: bool, error: str | None = None) -> dict[str, Any]:
         return {
@@ -505,6 +642,9 @@ class SAMTrackingAdapter:
             "object_model_error": self._object_model_error,
             "track_model_error": self._track_model_error,
             "sam2_status": self._sam2_error or "available",
+            "sam2_enabled": self.config.sam2_enabled,
+            "sam2_scan_frames": self.config.sam2_scan_frames,
+            "sam2_prompt_mode": self.config.sam2_prompt_mode,
             "requested_device": self.config.device,
             "runtime_device": self._runtime_device,
             "target_labels": self.config.target_labels,
@@ -555,6 +695,159 @@ class _OpticalFlowMaskSmoother:
             self._prev_frame = frame.copy()
             self._prev_mask = mask.copy()
             return mask
+
+
+class _SAM2VideoMemoryTracker:
+    """Embedded SAM2 streaming-memory video tracker used by STEAD."""
+
+    def __init__(
+        self,
+        sam2_config: str,
+        sam2_checkpoint: str,
+        device: str = "cuda",
+        prompt_mode: str = "bounding_box",
+        scan_frames: int = 30,
+        new_obj_iou_thresh: float = 0.3,
+    ) -> None:
+        self.sam2_config = sam2_config
+        self.sam2_checkpoint = sam2_checkpoint
+        self.device = device
+        self.prompt_mode = prompt_mode
+        self.scan_frames = scan_frames
+        self.new_obj_iou_thresh = new_obj_iou_thresh
+        self._predictor: Any | None = None
+        self._inference_state: Any | None = None
+        self._propagate_gen: Any | None = None
+        self._object_counter = 0
+        self._registered_boxes: list[Any] = []
+        self._has_objects = False
+
+    def initialize_video(self, video_path: str, scan_prompts: list[dict[str, Any]] | None = None) -> None:
+        """Initialize SAM2 state and register unique YOLO boxes from scan prompts."""
+        predictor = self._load_model()
+        self._inference_state = predictor.init_state(
+            video_path=video_path,
+            offload_video_to_cpu=True,
+            async_loading_frames=True,
+        )
+        self._object_counter = 0
+        self._registered_boxes = []
+        prompts = scan_prompts or []
+        for frame_idx, prompt in enumerate(prompts[: self.scan_frames]):
+            for box in prompt.get("boxes", []) or []:
+                if any(_box_iou(box, registered) > self.new_obj_iou_thresh for registered in self._registered_boxes):
+                    continue
+                obj_id = self._object_counter
+                self._object_counter += 1
+                self._registered_boxes.append(box)
+                predictor.add_new_points_or_box(
+                    inference_state=self._inference_state,
+                    frame_idx=0,
+                    obj_id=obj_id,
+                    box=box,
+                )
+        self._has_objects = bool(self._registered_boxes)
+        self._propagate_gen = predictor.propagate_in_video(self._inference_state) if self._has_objects else None
+
+    def track_frame(self, frame_idx: int, yolo_prompts: dict[str, Any] | None = None) -> tuple[list[Any], list[float], list[int]]:
+        """Return SAM2 propagated masks for current frame."""
+        if self._inference_state is None:
+            raise RuntimeError("SAM2 tracker not initialized")
+        if self._propagate_gen is None:
+            return [], [], []
+        try:
+            out_frame_idx, out_obj_ids, out_logits = next(self._propagate_gen)
+        except StopIteration:
+            return [], [], []
+        try:
+            import numpy as np
+            import torch
+
+            if isinstance(out_logits, torch.Tensor):
+                masks_tensor = (torch.sigmoid(out_logits) > 0.5).squeeze(1).detach().cpu().numpy().astype(np.uint8)
+            else:
+                masks_tensor = (np.asarray(out_logits) > 0.5).squeeze(1).astype(np.uint8)
+            if masks_tensor.ndim == 2:
+                masks_tensor = np.expand_dims(masks_tensor, 0)
+            masks = [mask for mask in masks_tensor]
+            ids = list(out_obj_ids) if hasattr(out_obj_ids, "__iter__") else [int(out_obj_ids)]
+            return masks, [1.0] * len(ids), [int(item) for item in ids]
+        except Exception as exc:
+            logger.warning("SAM2 output conversion failed at frame=%s: %s", frame_idx, exc)
+            return [], [], []
+
+    def _load_model(self) -> Any:
+        if self._predictor is not None:
+            return self._predictor
+        from hydra import initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+        from sam2.build_sam import build_sam2_video_predictor
+
+        if GlobalHydra.instance().is_initialized():
+            GlobalHydra.instance().clear()
+        config_dir, config_name = _resolve_sam2_config(self.sam2_config)
+        logger.info("SAM2 config resolved: dir=%s name=%s", config_dir, config_name)
+        with initialize_config_dir(config_dir=config_dir, version_base=None):
+            self._predictor = build_sam2_video_predictor(config_name, self.sam2_checkpoint, device=self.device)
+        return self._predictor
+
+
+class _OpticalFlowProbabilitySmoother:
+    """Optical-flow guided temporal probability smoothing from the SAM2 reference pipeline."""
+
+    def __init__(self, enabled: bool = True, entropy_epsilon: float = 1e-8, binarize_threshold: float = 0.5) -> None:
+        self.enabled = enabled
+        self.entropy_epsilon = entropy_epsilon
+        self.binarize_threshold = binarize_threshold
+        self._prev_frame: Any | None = None
+        self._prev_probability: Any | None = None
+
+    def smooth_mask(self, frame: Any, mask: Any) -> Any:
+        """Smooth a binary SAM2 mask via probability fusion."""
+        if not self.enabled:
+            return mask
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            return mask
+        probability = cv2.GaussianBlur(np.asarray(mask).astype(np.float32), (5, 5), sigmaX=1.0)
+        if self._prev_frame is None or self._prev_probability is None:
+            self._prev_frame = frame.copy()
+            self._prev_probability = probability.copy()
+            return (probability >= self.binarize_threshold).astype(np.uint8)
+        try:
+            prev_gray = cv2.cvtColor(self._prev_frame, cv2.COLOR_BGR2GRAY) if self._prev_frame.ndim == 3 else self._prev_frame
+            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+            flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            h, w = flow.shape[:2]
+            y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
+            warped = cv2.remap(
+                self._prev_probability,
+                x_coords + flow[..., 0],
+                y_coords + flow[..., 1],
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            h_current = self._entropy(probability)
+            h_warped = self._entropy(warped)
+            alpha = h_current / (h_current + h_warped + self.entropy_epsilon)
+            fused = (1.0 - alpha) * probability + alpha * warped
+            self._prev_frame = frame.copy()
+            self._prev_probability = fused.copy()
+            return (fused >= self.binarize_threshold).astype(np.uint8)
+        except Exception:
+            self._prev_frame = frame.copy()
+            self._prev_probability = probability.copy()
+            return (probability >= self.binarize_threshold).astype(np.uint8)
+
+    def _entropy(self, probability: Any) -> Any:
+        import numpy as np
+
+        eps = max(self.entropy_epsilon, 1e-7)
+        p = np.clip(np.asarray(probability).astype(np.float64), eps, 1.0 - eps).astype(np.float32)
+        return (-p * np.log2(p) - (1.0 - p) * np.log2(1.0 - p)).astype(np.float32)
         try:
             prev_gray = cv2.cvtColor(self._prev_frame, cv2.COLOR_BGR2GRAY) if self._prev_frame.ndim == 3 else self._prev_frame
             curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
@@ -616,6 +909,56 @@ def mask_to_contours(mask: Any, max_contours: int = 8, epsilon_ratio: float = 0.
         return encoded
     except Exception:
         return []
+
+
+def _resolve_sam2_config(config: str) -> tuple[str, str]:
+    """Resolve SAM2 config directory/name for Hydra initialization."""
+    requested = Path(config)
+    candidates: list[Path] = []
+    repo_root = Path(__file__).resolve().parents[2]
+    local_sam2_root = repo_root / "src" / "segment-anything-2" / "sam2"
+
+    if requested.as_posix() in {"sam2_hiera_l", "sam2_hiera_l.yaml"}:
+        candidates.append(local_sam2_root / "configs" / "sam2" / "sam2_hiera_l.yaml")
+    if requested.exists():
+        candidates.append(requested.resolve())
+    cwd_candidate = (Path.cwd() / requested).resolve()
+    if cwd_candidate.exists():
+        candidates.append(cwd_candidate)
+    candidates.extend(
+        [
+            repo_root / requested.name,
+            repo_root / "configs" / requested.name,
+            local_sam2_root / "configs" / "sam2" / requested.name,
+            local_sam2_root / requested.name,
+        ]
+    )
+    try:
+        import sam2 as sam2_pkg
+
+        sam2_root = Path(sam2_pkg.__file__).resolve().parent
+        candidates.extend(
+            [
+                sam2_root / "configs" / "sam2" / requested.name,
+                sam2_root / requested.name,
+            ]
+        )
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate.exists() and _is_real_sam2_config(candidate):
+            return str(candidate.parent.resolve()), candidate.stem
+    fallback_parent = requested.parent if str(requested.parent) not in {"", "."} else Path(".")
+    return str(fallback_parent.resolve()), requested.stem
+
+
+def _is_real_sam2_config(path: Path) -> bool:
+    """Return True for actual SAM2 Hydra YAML files, not pointer placeholders."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    return "model:" in text and "_target_" in text
 
 
 def _detection_to_dict(det: Detection) -> dict[str, Any]:

@@ -1,9 +1,9 @@
-detector: yolo
-yolo_model_path: yolov8n.pt
-conf_threshold: 0.35
-tracker: simple_iou
+detector: yolo11_railway
+yolo_model_path: weights/yolo11l.pt
+conf_threshold: 0.25
+tracker: sam_tracking
 sam_tracking:
-  enabled: false
+  enabled: true
   object_model_path: "weights/yolo11l.pt"
   track_model_path: "weights/best.pt"
   sam2_config: "sam2_hiera_l.yaml"
@@ -19,6 +19,13 @@ sam_tracking:
   confirm_count: 3
   use_optical_flow: true
   fallback_to_bbox_mask: true
+  sam2_enabled: true
+  sam2_scan_frames: 30
+  sam2_prompt_mode: "bounding_box"
+  sam2_new_object_iou_threshold: 0.3
+  sample_every: 15
+  track_mask_interval: 30
+  imgsz: 640
 vlm_provider: mock
 qwen_model: qwen-vl-plus
 dashscope_api_key_env: DASHSCOPE_API_KEY

@@ -1,6 +1,8 @@
+from pathlib import Path
+
 import numpy as np
 
-from src.perception.sam_tracking_adapter import SlidingWindowIntrusionJudge, bbox_to_mask
+from src.perception.sam_tracking_adapter import SlidingWindowIntrusionJudge, _resolve_sam2_config, bbox_to_mask
 
 
 def test_mask_iou_and_bbox_mask():
@@ -30,3 +32,12 @@ def test_object_overlap_detects_small_object_inside_large_track():
 
     assert state["suspicious"] is True
     assert state["alarm"] is True
+
+
+def test_resolve_sam2_config_skips_pointer_file():
+    config_dir, config_name = _resolve_sam2_config("sam2_hiera_l.yaml")
+
+    assert config_name == "sam2_hiera_l"
+    config_path = Path(config_dir) / f"{config_name}.yaml"
+    assert config_path.exists()
+    assert "configs/sam2" not in config_path.read_text(encoding="utf-8").strip()

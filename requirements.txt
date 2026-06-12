@@ -1,10 +1,77 @@
+# Railway Intrusion Threat Tracking System based on SAM2
+
+# Merged requirements for:
+
+# - RailwayIntrusion_Tracking_SAM2
+
+# - Multi-camera / VLM event analysis pipeline
+
+#
+
+# Recommended Python: 3.10
+
+#
+
+# Important:
+
+# Install torch / torchvision separately according to your CUDA version.
+
+# Do NOT put CUDA-specific torch wheels here.
+ 
+# ===== API / Pipeline Runtime =====
+
 pydantic==2.5.0
-pyyaml==6.0.1
 fastapi==0.104.1
 uvicorn==0.24.0
 python-dotenv==1.0.0
-ultralytics==8.1.0
-dashscope==1.25.1
-opencv-python==4.10.0.84
 requests==2.31.0
+dashscope==1.25.1
+
+# ===== YOLO / Detection =====
+
+# Use >=8.3.0 for YOLOv11 compatibility.
+
+# Avoid ultralytics==8.1.0 because it is too old for YOLOv11-style usage.
+
+ultralytics>=8.3.0,<9.0.0
+
+# ===== Tracking Baselines =====
+
+boxmot>=10.0.0
+deep-sort-realtime>=1.3.0
+
+# ===== Computer Vision & Image Processing =====
+
+# opencv-contrib-python includes the standard cv2 modules plus contrib modules.
+
+# Do not also pin opencv-python unless you have a specific reason.
+
+opencv-contrib-python==4.10.0.84
+scikit-image>=0.21.0
+Pillow>=10.0.0
+
+# ===== Scientific Computing =====
+
 numpy==1.26.4
+scipy>=1.10.0
+pandas>=2.0.0
+
+# ===== Evaluation =====
+
+motmetrics>=1.4.0
+scikit-learn>=1.3.0
+
+# ===== Configuration / Logging / Utilities =====
+
+pyyaml==6.0.1
+tqdm>=4.65.0
+matplotlib>=3.7.0
+python-json-logger>=2.0.0
+
+# ===== Optional: RAFT optical flow =====
+
+# Uncomment only if you actually use RAFT.
+
+# timm>=0.9.0
+
+# imageio>=2.31.0

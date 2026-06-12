@@ -151,6 +151,9 @@ def run_pipeline(
     sam_window_size: int = 5,
     sam_confirm_count: int = 3,
     sam_use_optical_flow: bool = True,
+    sam2_enabled: bool = True,
+    sam2_scan_frames: int = 30,
+    sam2_prompt_mode: str = "bounding_box",
     sam_sample_every: int = 15,
     sam_track_mask_interval: int = 30,
     sam_imgsz: int = 640,
@@ -194,6 +197,9 @@ def run_pipeline(
             window_size=sam_window_size,
             confirm_count=sam_confirm_count,
             use_optical_flow=sam_use_optical_flow,
+            sam2_enabled=sam2_enabled,
+            sam2_scan_frames=sam2_scan_frames,
+            sam2_prompt_mode=sam2_prompt_mode,
             sample_every=sam_sample_every,
             track_mask_interval=sam_track_mask_interval,
             imgsz=sam_imgsz,
@@ -517,6 +523,9 @@ def main() -> int:
     parser.add_argument("--sam-window-size", type=int, default=5)
     parser.add_argument("--sam-confirm-count", type=int, default=3)
     parser.add_argument("--sam-use-optical-flow", default="true")
+    parser.add_argument("--sam2-enabled", default="true")
+    parser.add_argument("--sam2-scan-frames", type=int, default=30)
+    parser.add_argument("--sam2-prompt-mode", default="bounding_box", choices=["bounding_box", "center_point", "centroid"])
     parser.add_argument("--sam-sample-every", type=int, default=15, help="Run object detection every N frames in SAMTracking")
     parser.add_argument("--sam-track-mask-interval", type=int, default=30, help="Run railway mask segmentation every N frames in SAMTracking")
     parser.add_argument("--sam-imgsz", type=int, default=640, help="YOLO inference image size for SAMTracking")
@@ -570,6 +579,9 @@ def main() -> int:
             sam_window_size=args.sam_window_size,
             sam_confirm_count=args.sam_confirm_count,
             sam_use_optical_flow=_parse_bool(args.sam_use_optical_flow),
+            sam2_enabled=_parse_bool(args.sam2_enabled),
+            sam2_scan_frames=args.sam2_scan_frames,
+            sam2_prompt_mode=args.sam2_prompt_mode,
             sam_sample_every=args.sam_sample_every,
             sam_track_mask_interval=args.sam_track_mask_interval,
             sam_imgsz=args.sam_imgsz,
