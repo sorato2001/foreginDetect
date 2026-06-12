@@ -2,6 +2,22 @@ detector: yolo
 yolo_model_path: yolov8n.pt
 conf_threshold: 0.35
 tracker: simple_iou
+sam_tracking:
+  enabled: false
+  object_model_path: "weights/yolo11l.pt"
+  track_model_path: "weights/best.pt"
+  sam2_config: "sam2_hiera_l.yaml"
+  sam2_checkpoint: "weights/sam2_hiera_large.pt"
+  device: "cuda"
+  target_labels:
+    - person
+    - cow
+    - sheep
+  iou_threshold: 0.10
+  window_size: 5
+  confirm_count: 3
+  use_optical_flow: true
+  fallback_to_bbox_mask: true
 vlm_provider: mock
 qwen_model: qwen-vl-plus
 dashscope_api_key_env: DASHSCOPE_API_KEY

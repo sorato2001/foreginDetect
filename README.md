@@ -19,6 +19,19 @@ event video
   -> alarm_result.json
 ```
 
+Optional SAMTracking tracker mode:
+
+```text
+event video frames
+  -> YOLO11l detection (person/cow/sheep)
+  -> best.pt railway/track segmentation
+  -> SAM2 segmentation + streaming-memory tracking when configured
+  -> optical-flow temporal mask smoothing
+  -> mask-IoU intrusion judgment
+  -> sliding-window confirmation
+  -> STEAD ROI/rule/VLM/alarm fusion
+```
+
 This branch is STEAD-only. Legacy RTSP/FTP recording code has been removed from
 this branch so the repository is focused on the research prototype.
 
@@ -71,6 +84,42 @@ python -m src.pipeline.analyze_event \
   --vlm-provider mock \
   --mock-detections
 ```
+
+SAMTracking tracker adapter demo:
+
+```bash
+python -m src.pipeline.analyze_event \
+  --input-type video \
+  --video examples/test_h264.mp4 \
+  --camera-id cam02 \
+  --rules configs/rules.example.yaml \
+  --output outputs/sam_tracking_demo \
+  --vlm-provider mock \
+  --tracker sam_tracking \
+  --sam-object-model ../RailwayIntrusion_Tracking_SAM2/weights/yolo11l.pt \
+  --sam-track-model ../RailwayIntrusion_Tracking_SAM2/weights/best.pt \
+  --sam2-config ../RailwayIntrusion_Tracking_SAM2/sam2_hiera_l.yaml \
+  --sam2-checkpoint ../RailwayIntrusion_Tracking_SAM2/weights/sam2_hiera_large.pt \
+  --sam-iou-threshold 0.10 \
+  --sam-window-size 5 \
+  --sam-confirm-count 3 \
+  --sam-sample-every 15 \
+  --sam-track-mask-interval 30 \
+  --sam-imgsz 640 \
+  --max-analysis-frames 60 \
+  --visualization-max-frames 60
+```
+
+`--tracker simple_iou` remains the default. `--tracker sam_tracking` writes an
+extra artifact:
+
+```text
+outputs/sam_tracking_demo/sam_tracking_result.json
+```
+
+If YOLO11/SAM2/`best.pt` weights are missing, the adapter degrades cleanly and
+records the reason in `sam_tracking_result.json.metadata` instead of stopping
+the STEAD pipeline.
 
 Image input:
 
@@ -184,6 +233,61 @@ For long videos, the CLI limits processing by default:
 - `--visualization-max-frames 300`
 
 Set either value to `0` to process the full video.
+
+## SAMTracking Adapter
+
+The optional SAMTracking adapter lives in `src/perception/sam_tracking_adapter.py`.
+It is designed to reference the `RailwayIntrusion_Tracking_SAM2` method while
+keeping STEAD runnable on CPU-only or dependency-light demo machines.
+
+The adapter output contains:
+
+- `tracks`: STEAD-compatible tracked detections for evidence building
+- `frames`: per-frame detections, object-mask count, railway-mask availability,
+  max mask IoU, suspicious flag, sliding-window count, and alarm flag
+- `intrusion_events`: confirmed sliding-window intrusion intervals
+- `metadata`: model paths, loaded/degraded status, SAM2 status, thresholds, and
+  fallback diagnostics
+
+Useful CLI switches:
+
+```text
+--tracker simple_iou|sam_tracking
+--sam-object-model <path-to-yolo11l.pt>
+--sam-track-model <path-to-best.pt>
+--sam2-config <path-to-sam2-config.yaml>
+--sam2-checkpoint <path-to-sam2-checkpoint.pt>
+--sam-iou-threshold 0.10
+--sam-window-size 5
+--sam-confirm-count 3
+--sam-use-optical-flow true
+--sam-sample-every 15
+--sam-track-mask-interval 30
+--sam-imgsz 640
+```
+
+For first-time debugging, avoid full-video heavy inference:
+
+```bash
+python -m src.pipeline.analyze_event \
+  --input-type video \
+  --video examples/test_h264.mp4 \
+  --camera-id cam02 \
+  --rules configs/rules.image.yaml \
+  --output outputs/sam_tracking_fast_check \
+  --vlm-provider mock \
+  --track sam_tracking \
+  --sam-object-model weights/yolo11l.pt \
+  --sam-track-model weights/best.pt \
+  --max-analysis-frames 60 \
+  --no-visualization \
+  --sam-device cpu \
+  --sam-progress-interval 1
+```
+
+`--max-analysis-frames 0` and `--visualization-max-frames 0` mean full video.
+With YOLO11l plus track segmentation this can be slow on CPU, especially for
+large videos.
 
 ## Logs
 

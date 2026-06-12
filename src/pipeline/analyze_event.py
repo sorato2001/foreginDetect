@@ -16,6 +16,7 @@ from src.evidence.evidence_builder import build_object_tracks, empty_evidence
 from src.evidence.serializers import save_json, save_model
 from src.evidence.window_builder import WindowBuilder
 from src.perception.detector import Detection
+from src.perception.sam_tracking_adapter import SAMTrackingAdapter, SAMTrackingConfig, SAMTrackingResult
 from src.perception.simple_iou_tracker import SimpleIOUTracker
 from src.perception.yolo_detector import YoloDetector
 from src.rules.rule_engine import RuleEngine
@@ -113,6 +114,16 @@ def _detect_video(
     return tracker.tracks, fps, duration
 
 
+def _detect_video_with_sam_tracking(
+    video_path: str,
+    config: SAMTrackingConfig,
+    max_analysis_frames: int | None = 900,
+) -> SAMTrackingResult:
+    """Run the optional SAMTracking tracker adapter."""
+    adapter = SAMTrackingAdapter(config)
+    return adapter.analyze_video(video_path, max_frames=max_analysis_frames)
+
+
 def run_pipeline(
     video_path: str,
     camera_id: str,
@@ -128,6 +139,20 @@ def run_pipeline(
     max_analysis_frames: int | None = 900,
     visualization_max_frames: int | None = 300,
     log_level: str = "INFO",
+    tracker: str = "simple_iou",
+    sam_object_model: str | None = None,
+    sam_track_model: str | None = None,
+    sam2_config: str | None = None,
+    sam2_checkpoint: str | None = None,
+    sam_device: str = "cuda",
+    sam_iou_threshold: float = 0.10,
+    sam_window_size: int = 5,
+    sam_confirm_count: int = 3,
+    sam_use_optical_flow: bool = True,
+    sam_sample_every: int = 15,
+    sam_track_mask_interval: int = 30,
+    sam_imgsz: int = 640,
+    sam_progress_interval: int = 10,
 ) -> dict:
     """Run STEAD event analysis and write JSON artifacts."""
     event_id = event_id or f"event_{uuid.uuid4().hex[:8]}"
@@ -143,8 +168,9 @@ def run_pipeline(
         vlm_provider,
     )
     logger.info(
-        "STEP 01 config: rules=%s mock_detections=%s max_analysis_frames=%s save_visualization=%s visualization_max_frames=%s",
+        "STEP 01 config: rules=%s tracker=%s mock_detections=%s max_analysis_frames=%s save_visualization=%s visualization_max_frames=%s",
         rules_path,
+        tracker,
         mock_detections,
         max_analysis_frames,
         save_visualization,
@@ -152,11 +178,38 @@ def run_pipeline(
     )
 
     step_start = time.perf_counter()
-    logger.info("STEP 02 detector/tracker: begin")
-    tracks, fps, duration = _detect_video(video_path, mock_detections=mock_detections, max_analysis_frames=max_analysis_frames)
+    logger.info("STEP 02 detector/tracker: begin tracker=%s", tracker)
+    sam_tracking_result: SAMTrackingResult | None = None
+    if tracker == "sam_tracking" and not mock_detections:
+        sam_config = SAMTrackingConfig(
+            object_model_path=sam_object_model or SAMTrackingConfig().object_model_path,
+            track_model_path=sam_track_model or SAMTrackingConfig().track_model_path,
+            sam2_config=sam2_config,
+            sam2_checkpoint=sam2_checkpoint,
+            device=sam_device,
+            iou_threshold=sam_iou_threshold,
+            window_size=sam_window_size,
+            confirm_count=sam_confirm_count,
+            use_optical_flow=sam_use_optical_flow,
+            sample_every=sam_sample_every,
+            track_mask_interval=sam_track_mask_interval,
+            imgsz=sam_imgsz,
+            progress_interval=sam_progress_interval,
+        )
+        sam_tracking_result = _detect_video_with_sam_tracking(
+            video_path,
+            sam_config,
+            max_analysis_frames=max_analysis_frames,
+        )
+        tracks, fps, duration = sam_tracking_result.tracks, sam_tracking_result.fps, sam_tracking_result.duration
+    else:
+        if tracker == "sam_tracking" and mock_detections:
+            logger.info("STEP 02 detector/tracker: mock_detections requested; using deterministic tracks instead of SAMTracking")
+        tracks, fps, duration = _detect_video(video_path, mock_detections=mock_detections, max_analysis_frames=max_analysis_frames)
     detection_count = sum(len(history) for history in tracks.values())
     logger.info(
-        "STEP 02 detector/tracker: done tracks=%s detections=%s fps=%.3f duration=%.3fs elapsed=%.3fs",
+        "STEP 02 detector/tracker: done tracker=%s tracks=%s detections=%s fps=%.3f duration=%.3fs elapsed=%.3fs",
+        tracker,
         len(tracks),
         detection_count,
         fps,
@@ -189,7 +242,25 @@ def run_pipeline(
     step_start = time.perf_counter()
     logger.info("STEP 05 windows: build temporal windows")
     evidence.windows = WindowBuilder().build(evidence)
-    evidence.metadata.update({"mock_detections": mock_detections, "stead_version": "stead_v1"})
+    evidence.metadata.update({"mock_detections": mock_detections, "stead_version": "stead_v1", "tracker": tracker})
+    sam_tracking_artifact: str | None = None
+    if sam_tracking_result is not None:
+        sam_tracking_artifact = str(out / "sam_tracking_result.json")
+        save_json(sam_tracking_result.to_json_dict(), sam_tracking_artifact)
+        evidence.metadata["sam_tracking"] = {
+            "artifact": sam_tracking_artifact,
+            "degraded": sam_tracking_result.metadata.get("degraded"),
+            "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
+            "intrusion_events": len(sam_tracking_result.intrusion_events),
+            "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
+            "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
+        }
+        logger.info(
+            "STEP 05 windows: SAMTracking artifact=%s degraded=%s intrusion_events=%s",
+            sam_tracking_artifact,
+            sam_tracking_result.metadata.get("degraded"),
+            len(sam_tracking_result.intrusion_events),
+        )
     logger.info("STEP 05 windows: done windows=%s elapsed=%.3fs", len(evidence.windows), time.perf_counter() - step_start)
 
     visualization_artifacts = {}
@@ -293,6 +364,7 @@ def run_pipeline(
         "alarm_result": str(out / "alarm_result.json"),
         "visualization": visualization_artifacts,
         "pipeline_log": log_path,
+        "sam_tracking_result": sam_tracking_artifact,
         "final_level": alarm.final_level,
         "is_alarm": alarm.is_alarm,
     }
@@ -342,6 +414,20 @@ def main() -> int:
     parser.add_argument("--max-analysis-frames", type=int, default=900, help="Max video frames to scan; 0 means full video")
     parser.add_argument("--visualization-max-frames", type=int, default=300, help="Max annotated-video frames; 0 means full video")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--tracker", "--track", dest="tracker", choices=["simple_iou", "sam_tracking"], default="simple_iou")
+    parser.add_argument("--sam-object-model", default=None, help="YOLO11 object model path for SAMTracking")
+    parser.add_argument("--sam-track-model", default=None, help="Rail/track segmentation best.pt path for SAMTracking")
+    parser.add_argument("--sam2-config", default=None, help="SAM2 config path for SAMTracking")
+    parser.add_argument("--sam2-checkpoint", default=None, help="SAM2 checkpoint path for SAMTracking")
+    parser.add_argument("--sam-device", default="cuda")
+    parser.add_argument("--sam-iou-threshold", type=float, default=0.10)
+    parser.add_argument("--sam-window-size", type=int, default=5)
+    parser.add_argument("--sam-confirm-count", type=int, default=3)
+    parser.add_argument("--sam-use-optical-flow", default="true")
+    parser.add_argument("--sam-sample-every", type=int, default=15, help="Run object detection every N frames in SAMTracking")
+    parser.add_argument("--sam-track-mask-interval", type=int, default=30, help="Run railway mask segmentation every N frames in SAMTracking")
+    parser.add_argument("--sam-imgsz", type=int, default=640, help="YOLO inference image size for SAMTracking")
+    parser.add_argument("--sam-progress-interval", type=int, default=10, help="Log SAMTracking progress every N processed frames")
     args = parser.parse_args()
     if args.input_type == "image":
         if not args.image:
@@ -380,6 +466,20 @@ def main() -> int:
             max_analysis_frames=args.max_analysis_frames or None,
             visualization_max_frames=args.visualization_max_frames or None,
             log_level=args.log_level,
+            tracker=args.tracker,
+            sam_object_model=args.sam_object_model,
+            sam_track_model=args.sam_track_model,
+            sam2_config=args.sam2_config,
+            sam2_checkpoint=args.sam2_checkpoint,
+            sam_device=args.sam_device,
+            sam_iou_threshold=args.sam_iou_threshold,
+            sam_window_size=args.sam_window_size,
+            sam_confirm_count=args.sam_confirm_count,
+            sam_use_optical_flow=_parse_bool(args.sam_use_optical_flow),
+            sam_sample_every=args.sam_sample_every,
+            sam_track_mask_interval=args.sam_track_mask_interval,
+            sam_imgsz=args.sam_imgsz,
+            sam_progress_interval=args.sam_progress_interval,
         )
     print(json.dumps(result, ensure_ascii=False))
     return 0
