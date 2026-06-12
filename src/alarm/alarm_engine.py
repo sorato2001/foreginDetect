@@ -76,7 +76,17 @@ class AlarmEngine:
     @staticmethod
     def _reasons(rules: list[ROIRuleTrigger], review: VLMReview, final_score: float) -> list[str]:
         reasons = [f"Rule {rule.rule_id} triggered with {rule.severity_hint} severity." for rule in rules]
+        metadata = review.metadata or {}
+        if metadata.get("fallback") and metadata.get("provider") == "qwen":
+            error_type = str(metadata.get("error_type", "unknown"))
+            timeout = metadata.get("read_timeout_seconds") or metadata.get("timeout_seconds")
+            timeout_text = f" after {timeout:g}s" if isinstance(timeout, (int, float)) else ""
+            reasons.append(f"Qwen review failed with {error_type}{timeout_text}.")
+            reasons.append("Fallback VLM review was used.")
+            if rules:
+                reasons.append("Final alarm level is based on rule_score only or conservative fallback.")
+            else:
+                reasons.append("No rule was triggered; Qwen failure does not mean Qwen judged the event normal.")
         reasons.append(f"VLM: {review.reason}")
         reasons.append(f"Final fused score={final_score:.3f}.")
         return reasons
-

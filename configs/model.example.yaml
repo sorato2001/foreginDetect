@@ -5,5 +5,12 @@ tracker: simple_iou
 vlm_provider: mock
 qwen_model: qwen-vl-plus
 dashscope_api_key_env: DASHSCOPE_API_KEY
-timeout_sec: 20
-
+timeout_sec: 60
+vlm:
+  provider: qwen
+  timeout_seconds: 60
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 60
+  max_retries: 2
+  retry_backoff_seconds: 2
+  fallback_on_error: true

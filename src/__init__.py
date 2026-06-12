@@ -1,7 +1,5 @@
 """STEAD research prototype package.
 
-The package is a compatible research layer on top of the existing
-multi-camera event system. It keeps legacy ``app`` entry points intact while
-adding structured temporal evidence, VLM review, and graded alarm fusion.
+The package contains structured temporal evidence extraction, ROI rules, VLM
+review, and graded alarm fusion for surveillance anomaly detection.
 """
-

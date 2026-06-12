@@ -20,3 +20,12 @@ def test_missing_field_returns_error():
     assert review is None
     assert error is not None
 
+
+def test_null_fields_are_normalized():
+    text = '{"is_anomaly": false, "event_type": null, "alarm_level_suggestion": "low", "confidence": 0.15, "evidence_time": null, "evidence_tracks": [], "matched_rules": [], "reason": "ok", "possible_false_alarm": true, "recommended_action": "none"}'
+    review, error = parse_vlm_review(text)
+    assert error is None
+    assert review is not None
+    assert review.event_type == "none"
+    assert review.evidence_time == []
+    assert review.metadata["normalized"] is True

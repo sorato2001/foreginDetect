@@ -1,7 +1,5 @@
 # API
 
-The legacy API remains in `app/api.py`.
-
 The STEAD research API is in `src/api/main.py`.
 
 Run:
@@ -32,4 +30,3 @@ Example body for `POST /analysis/event`:
   "vlm_provider": "mock"
 }
 ```
-

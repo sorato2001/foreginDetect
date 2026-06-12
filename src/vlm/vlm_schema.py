@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -22,4 +22,4 @@ class VLMReview(BaseModel):
     reason: str
     possible_false_alarm: bool = False
     recommended_action: str
-
+    metadata: dict[str, Any] = Field(default_factory=dict)

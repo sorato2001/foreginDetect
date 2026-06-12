@@ -18,4 +18,6 @@ def test_pipeline_smoke_with_mock_detections(tmp_path):
     assert Path(result["event_evidence"]).exists()
     assert Path(result["vlm_review"]).exists()
     assert Path(result["alarm_result"]).exists()
-
+    log_path = Path(result["pipeline_log"])
+    assert log_path.exists()
+    assert "STEP 02 detector/tracker" in log_path.read_text(encoding="utf-8")

@@ -1,0 +1,49 @@
+rois:
+  - roi_id: restricted_area_A
+    type: polygon
+    points:
+      - [0, 115]
+      - [1280, 180]
+      - [1445, 285]
+      - [1165, 455]
+      - [900, 595]
+      - [650, 735]
+      - [395, 910]
+      - [0, 910]
+
+rules:
+  - rule_id: restricted_area_intrusion
+    type: intrusion
+    roi_id: restricted_area_A
+    target_labels: ["person"]
+    severity: high
+
+  - rule_id: perimeter_line_crossing
+    type: line_crossing
+    line:
+      - [395, 910]
+      - [1445, 285]
+    target_labels: ["person"]
+    severity: high
+
+  - rule_id: loitering_near_gate
+    type: loitering
+    roi_id: restricted_area_A
+    target_labels: ["person"]
+    threshold_seconds: 3
+    severity: medium
+
+  - rule_id: gathering_in_restricted_area
+    type: gathering
+    roi_id: restricted_area_A
+    target_labels: ["person"]
+    threshold_count: 3
+    severity: medium
+
+  - rule_id: person_near_equipment
+    type: proximity
+    target_labels: ["person"]
+    object_labels: ["equipment", "object", "vehicle"]
+    threshold_pixels: 80
+    severity: low
+

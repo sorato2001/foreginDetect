@@ -6,13 +6,7 @@ large model for review.
 
 ## Architecture
 
-Existing runtime:
-
-```text
-RTSP/FFmpeg cache -> FTP alarm image -> event clip/image -> SQLite/FastAPI
-```
-
-STEAD research layer:
+Core research pipeline:
 
 ```text
 event video/image
@@ -26,8 +20,9 @@ event video/image
   -> alarm_result.json
 ```
 
-The old `app/` package is not removed. The new `src/` package is a compatible
-prototype layer for experiments, papers, and future integration.
+This branch keeps only the STEAD research prototype. Live stream, FTP, or other
+production ingestion systems should be connected through the adapter boundaries
+under `src/ingestion/`.
 
 ## Schemas
 
@@ -82,4 +77,3 @@ For UCF-Crime, XD-Violence, ShanghaiTech, and UCSD Ped2, map each clip into
 `EventEvidence`, evaluate frame-level/event-level labels with the same alarm
 engine, and compare rule-only, VLM-only, caption+LLM, structured evidence+LLM,
 and full STEAD variants.
-
