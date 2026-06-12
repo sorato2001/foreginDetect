@@ -74,6 +74,8 @@ def build_review_prompt(evidence: EventEvidence) -> str:
         f"{SYSTEM_PROMPT}\n"
         "Review this structured temporal evidence and decide whether it is a real anomaly.\n"
         "Track Stream: object tracks, trajectories, ROI states, dwell time, and direction.\n"
+        "SAMTracking Stream: if metadata.sam_tracking.summary exists, review railway track mask availability, "
+        "object detections, mask-IoU intrusion score, suspicious frames, alarm frames, and sliding-window confirmation.\n"
         "Keyframe Stream: keyframe paths and boxes.\n"
         "Window Stream: short temporal window summaries.\n"
         "Return strictly one JSON object matching this schema:\n"

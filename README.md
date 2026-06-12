@@ -32,6 +32,20 @@ event video frames
   -> STEAD ROI/rule/VLM/alarm fusion
 ```
 
+When SAMTracking produces a railway/track mask, STEP 04 uses mask-IoU
+intrusion judgment as the rule source:
+
+```text
+object mask ∩ railway track mask
+  -> max MaskIoU
+  -> suspicious frame
+  -> sliding-window confirmation
+  -> sam_mask_iou_intrusion rule
+```
+
+If no segmentation/track mask is available, STEP 04 automatically falls back to
+the polygon/line rules in the YAML config.
+
 This branch is STEAD-only. Legacy RTSP/FTP recording code has been removed from
 this branch so the repository is focused on the research prototype.
 
@@ -242,9 +256,18 @@ The adapter output contains:
 - `tracks`: STEAD-compatible tracked detections for evidence building
 - `frames`: per-frame detections, object-mask count, railway-mask availability,
   max mask IoU, suspicious flag, sliding-window count, and alarm flag
+- `track_mask_contours` / `object_mask_contours`: compact mask outlines used by
+  `annotated_pipeline.mp4`
 - `intrusion_events`: confirmed sliding-window intrusion intervals
 - `metadata`: model paths, loaded/degraded status, SAM2 status, thresholds, and
   fallback diagnostics
+
+With `--tracker sam_tracking`, `annotated_pipeline.mp4` overlays:
+
+- railway/track segmentation mask
+- object mask outlines and detection boxes
+- `MaskIoU`, sliding-window count, and `NORMAL/SUSPICIOUS/ALARM` status
+- red border when the mask-IoU intrusion rule confirms an alarm
 
 Useful CLI switches:
 
@@ -255,6 +278,7 @@ Useful CLI switches:
 --sam2-config <path-to-sam2-config.yaml>
 --sam2-checkpoint <path-to-sam2-checkpoint.pt>
 --sam-iou-threshold 0.10
+--sam-object-overlap-threshold 0.15
 --sam-window-size 5
 --sam-confirm-count 3
 --sam-use-optical-flow true

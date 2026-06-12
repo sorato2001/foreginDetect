@@ -40,6 +40,7 @@ class SAMTrackingConfig:
     conf_threshold: float = 0.35
     target_labels: list[str] = field(default_factory=lambda: ["person", "cow", "sheep"])
     iou_threshold: float = 0.10
+    object_overlap_threshold: float = 0.15
     window_size: int = 5
     confirm_count: int = 3
     use_optical_flow: bool = True
@@ -60,9 +61,12 @@ class SAMFrameResult:
     object_mask_count: int
     track_mask_available: bool
     max_iou: float
+    max_object_overlap: float
     suspicious: bool
     window_count: int
     alarm: bool
+    track_mask_contours: list[list[list[int]]] = field(default_factory=list)
+    object_mask_contours: list[list[list[list[int]]]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -114,8 +118,15 @@ class SAMTrackingResult:
 class SlidingWindowIntrusionJudge:
     """Mask-IoU intrusion judge with K-frame/N-hit confirmation."""
 
-    def __init__(self, iou_threshold: float = 0.10, window_size: int = 5, confirm_count: int = 3) -> None:
+    def __init__(
+        self,
+        iou_threshold: float = 0.10,
+        object_overlap_threshold: float = 0.15,
+        window_size: int = 5,
+        confirm_count: int = 3,
+    ) -> None:
         self.iou_threshold = iou_threshold
+        self.object_overlap_threshold = object_overlap_threshold
         self.window_size = max(1, window_size)
         self.confirm_count = max(1, confirm_count)
         self.history: deque[int] = deque(maxlen=self.window_size)
@@ -138,9 +149,26 @@ class SlidingWindowIntrusionJudge:
         union = np.logical_or(a, b).sum()
         return float(intersection) / float(union) if union else 0.0
 
-    def update(self, frame_index: int, max_iou: float) -> dict[str, Any]:
+    @staticmethod
+    def compute_object_overlap(object_mask: Any, track_mask: Any) -> float:
+        """Compute how much of an object mask lies inside the track mask."""
+        try:
+            import numpy as np
+        except Exception:
+            return 0.0
+        obj = np.asarray(object_mask).astype(bool)
+        track = np.asarray(track_mask).astype(bool)
+        if obj.shape != track.shape:
+            return 0.0
+        obj_area = obj.sum()
+        if obj_area == 0:
+            return 0.0
+        intersection = np.logical_and(obj, track).sum()
+        return float(intersection) / float(obj_area)
+
+    def update(self, frame_index: int, max_iou: float, max_object_overlap: float = 0.0) -> dict[str, Any]:
         """Update suspicious-frame history and event lifecycle."""
-        suspicious = max_iou > self.iou_threshold
+        suspicious = max_iou > self.iou_threshold or max_object_overlap >= self.object_overlap_threshold
         self.history.append(1 if suspicious else 0)
         window_count = int(sum(self.history))
         alarm = window_count >= self.confirm_count
@@ -221,6 +249,7 @@ class SAMTrackingAdapter:
         tracker = SimpleIOUTracker(iou_threshold=0.3)
         judge = SlidingWindowIntrusionJudge(
             iou_threshold=self.config.iou_threshold,
+            object_overlap_threshold=self.config.object_overlap_threshold,
             window_size=self.config.window_size,
             confirm_count=self.config.confirm_count,
         )
@@ -264,8 +293,15 @@ class SAMTrackingAdapter:
             object_masks = self.segment_objects(frame, detections)
             if self.config.use_optical_flow and object_masks:
                 object_masks = [self._smoother.smooth(frame, mask) for mask in object_masks]
-            max_iou = max((judge.compute_iou(mask, track_mask) for mask in object_masks), default=0.0) if track_mask is not None else 0.0
-            state = judge.update(frame_index, max_iou)
+            if track_mask is not None:
+                max_iou = max((judge.compute_iou(mask, track_mask) for mask in object_masks), default=0.0)
+                max_object_overlap = max((judge.compute_object_overlap(mask, track_mask) for mask in object_masks), default=0.0)
+            else:
+                max_iou = 0.0
+                max_object_overlap = 0.0
+            state = judge.update(frame_index, max_iou, max_object_overlap=max_object_overlap)
+            track_mask_contours = mask_to_contours(track_mask) if track_mask is not None else []
+            object_mask_contours = [mask_to_contours(mask) for mask in object_masks]
             frames.append(
                 SAMFrameResult(
                     frame_index=frame_index,
@@ -274,9 +310,12 @@ class SAMTrackingAdapter:
                     object_mask_count=len(object_masks),
                     track_mask_available=track_mask is not None and bool(np.asarray(track_mask).sum() > 0),
                     max_iou=max_iou,
+                    max_object_overlap=max_object_overlap,
                     suspicious=bool(state["suspicious"]),
                     window_count=int(state["window_count"]),
                     alarm=bool(state["alarm"]),
+                    track_mask_contours=track_mask_contours,
+                    object_mask_contours=object_mask_contours,
                 )
             )
             processed += 1
@@ -369,17 +408,29 @@ class SAMTrackingAdapter:
                 verbose=False,
             )
             logger.info("SAMTracking track-mask predict done: elapsed=%.3fs", time.perf_counter() - start)
-            if not results or getattr(results[0], "masks", None) is None or results[0].masks is None:
-                return None
-            masks = results[0].masks.data
-            if len(masks) == 0:
-                return None
             merged = np.zeros(frame.shape[:2], dtype=np.uint8)
-            for mask_tensor in masks:
-                mask = mask_tensor.detach().cpu().numpy().astype("float32")
-                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-                merged = np.maximum(merged, (mask >= 0.5).astype(np.uint8))
-            return merged
+            has_any = False
+            for result in results or []:
+                if getattr(result, "masks", None) is not None and result.masks is not None:
+                    masks = result.masks.data
+                    for mask_tensor in masks:
+                        mask = mask_tensor.detach().cpu().numpy().astype("float32")
+                        mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                        merged = np.maximum(merged, (mask >= 0.5).astype(np.uint8))
+                        has_any = True
+                elif getattr(result, "boxes", None) is not None and result.boxes is not None:
+                    boxes = result.boxes.xyxy.detach().cpu().numpy()
+                    confs = result.boxes.conf.detach().cpu().numpy()
+                    for bbox, conf in zip(boxes, confs):
+                        if float(conf) < self.config.conf_threshold:
+                            continue
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+                        if x2 > x1 and y2 > y1:
+                            merged[y1:y2, x1:x2] = 1
+                            has_any = True
+            return merged if has_any else None
         except Exception as exc:
             logger.warning("SAMTracking track segmentation failed: %s", exc)
             return None
@@ -458,6 +509,7 @@ class SAMTrackingAdapter:
             "runtime_device": self._runtime_device,
             "target_labels": self.config.target_labels,
             "iou_threshold": self.config.iou_threshold,
+            "object_overlap_threshold": self.config.object_overlap_threshold,
             "window_size": self.config.window_size,
             "confirm_count": self.config.confirm_count,
             "use_optical_flow": self.config.use_optical_flow,
@@ -539,6 +591,31 @@ def bbox_to_mask(frame_shape: tuple[int, int] | list[int], bbox: list[float]) ->
     if x2 > x1 and y2 > y1:
         mask[y1:y2, x1:x2] = 1
     return mask
+
+
+def mask_to_contours(mask: Any, max_contours: int = 8, epsilon_ratio: float = 0.003) -> list[list[list[int]]]:
+    """Convert a binary mask to compact JSON-friendly contours."""
+    if mask is None:
+        return []
+    try:
+        import cv2
+        import numpy as np
+
+        binary = (np.asarray(mask) > 0).astype(np.uint8)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:max_contours]
+        encoded: list[list[list[int]]] = []
+        for contour in contours:
+            if len(contour) < 3 or cv2.contourArea(contour) < 16:
+                continue
+            epsilon = max(1.0, epsilon_ratio * cv2.arcLength(contour, True))
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            points = [[int(point[0][0]), int(point[0][1])] for point in approx]
+            if len(points) >= 3:
+                encoded.append(points)
+        return encoded
+    except Exception:
+        return []
 
 
 def _detection_to_dict(det: Detection) -> dict[str, Any]:

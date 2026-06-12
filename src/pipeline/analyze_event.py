@@ -13,6 +13,7 @@ from pathlib import Path
 from src.alarm.alarm_engine import AlarmEngine
 from src.config.settings import ensure_output_dir
 from src.evidence.evidence_builder import build_object_tracks, empty_evidence
+from src.evidence.evidence_schema import ROIRuleTrigger
 from src.evidence.serializers import save_json, save_model
 from src.evidence.window_builder import WindowBuilder
 from src.perception.detector import Detection
@@ -146,6 +147,7 @@ def run_pipeline(
     sam2_checkpoint: str | None = None,
     sam_device: str = "cuda",
     sam_iou_threshold: float = 0.10,
+    sam_object_overlap_threshold: float = 0.15,
     sam_window_size: int = 5,
     sam_confirm_count: int = 3,
     sam_use_optical_flow: bool = True,
@@ -188,6 +190,7 @@ def run_pipeline(
             sam2_checkpoint=sam2_checkpoint,
             device=sam_device,
             iou_threshold=sam_iou_threshold,
+            object_overlap_threshold=sam_object_overlap_threshold,
             window_size=sam_window_size,
             confirm_count=sam_confirm_count,
             use_optical_flow=sam_use_optical_flow,
@@ -230,7 +233,16 @@ def run_pipeline(
     step_start = time.perf_counter()
     logger.info("STEP 04 ROI/rules: load rules and evaluate")
     rule_engine = RuleEngine.from_yaml(rules_path)
-    evidence.roi_rules = rule_engine.evaluate(evidence)
+    sam_rule = _sam_tracking_mask_iou_rule(sam_tracking_result)
+    if sam_rule is not None:
+        evidence.roi_rules = [sam_rule]
+        evidence.metadata["rule_source"] = "sam_tracking_mask_iou"
+        logger.info("STEP 04 ROI/rules: using SAMTracking mask IoU rule because track mask is available")
+    else:
+        evidence.roi_rules = rule_engine.evaluate(evidence)
+        evidence.metadata["rule_source"] = "config_rules"
+        if tracker == "sam_tracking":
+            logger.info("STEP 04 ROI/rules: SAMTracking track mask unavailable; fallback to config rules")
     triggered_rules = [rule.rule_id for rule in evidence.roi_rules if rule.triggered]
     logger.info(
         "STEP 04 ROI/rules: done rules=%s triggered=%s elapsed=%.3fs",
@@ -254,6 +266,7 @@ def run_pipeline(
             "intrusion_events": len(sam_tracking_result.intrusion_events),
             "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
             "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
+            "summary": _sam_tracking_prompt_summary(sam_tracking_result),
         }
         logger.info(
             "STEP 05 windows: SAMTracking artifact=%s degraded=%s intrusion_events=%s",
@@ -370,6 +383,85 @@ def run_pipeline(
     }
 
 
+def _sam_tracking_mask_iou_rule(sam_tracking_result: SAMTrackingResult | None) -> ROIRuleTrigger | None:
+    """Build a STEP 04 rule result from SAMTracking mask-IoU intrusion judgment."""
+    if sam_tracking_result is None or not sam_tracking_result.metadata.get("track_mask_seen"):
+        return None
+    alarm_frames = [frame for frame in sam_tracking_result.frames if frame.alarm]
+    suspicious_frames = [frame for frame in sam_tracking_result.frames if frame.suspicious]
+    evidence_tracks = sorted(
+        {
+            track_id
+            for frame in suspicious_frames or alarm_frames
+            for det in frame.detections
+            for track_id, history in sam_tracking_result.tracks.items()
+            if any(item.frame_index == frame.frame_index and item.label == det.get("label") for item in history)
+        }
+    )
+    triggered = bool(alarm_frames or suspicious_frames)
+    trigger_frames = alarm_frames or suspicious_frames
+    trigger_time = [trigger_frames[0].timestamp, trigger_frames[-1].timestamp] if trigger_frames else None
+    peak_iou = max((frame.max_iou for frame in sam_tracking_result.frames), default=0.0)
+    severity = "high" if alarm_frames else "medium" if suspicious_frames else "none"
+    return ROIRuleTrigger(
+        rule_id="sam_mask_iou_intrusion",
+        rule_type="mask_iou_intrusion",
+        roi_id="segmented_railway_track",
+        triggered=triggered,
+        trigger_time=trigger_time,
+        evidence_tracks=evidence_tracks,
+        severity_hint=severity,
+    )
+
+
+def _sam_tracking_prompt_summary(sam_tracking_result: SAMTrackingResult) -> dict:
+    """Build a compact SAMTracking summary for VLM review."""
+    frames = sam_tracking_result.frames
+    suspicious = [frame for frame in frames if frame.suspicious]
+    alarms = [frame for frame in frames if frame.alarm]
+    peak = max(frames, key=lambda frame: max(frame.max_iou, frame.max_object_overlap), default=None)
+    sample_frames = alarms[:3] or suspicious[:3] or ([peak] if peak is not None else [])
+    return {
+        "rule_type": "mask_iou_intrusion",
+        "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
+        "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
+        "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
+        "sample_every": sam_tracking_result.metadata.get("sample_every"),
+        "track_mask_interval": sam_tracking_result.metadata.get("track_mask_interval"),
+        "iou_threshold": sam_tracking_result.metadata.get("iou_threshold"),
+        "object_overlap_threshold": sam_tracking_result.metadata.get("object_overlap_threshold"),
+        "window_size": sam_tracking_result.metadata.get("window_size"),
+        "confirm_count": sam_tracking_result.metadata.get("confirm_count"),
+        "max_iou": round(peak.max_iou, 4) if peak is not None else 0.0,
+        "max_object_overlap": round(peak.max_object_overlap, 4) if peak is not None else 0.0,
+        "peak_frame": peak.frame_index if peak is not None else None,
+        "suspicious_frame_count": len(suspicious),
+        "alarm_frame_count": len(alarms),
+        "intrusion_event_count": len(sam_tracking_result.intrusion_events),
+        "sample_frames": [
+            {
+                "frame_index": frame.frame_index,
+                "timestamp": round(frame.timestamp, 3),
+                "max_iou": round(frame.max_iou, 4),
+                "max_object_overlap": round(frame.max_object_overlap, 4),
+                "suspicious": frame.suspicious,
+                "alarm": frame.alarm,
+                "window_count": frame.window_count,
+                "detections": [
+                    {
+                        "label": det.get("label"),
+                        "confidence": round(float(det.get("confidence", 0.0)), 3),
+                        "bbox": det.get("bbox"),
+                    }
+                    for det in frame.detections[:5]
+                ],
+            }
+            for frame in sample_frames
+            if frame is not None
+        ],
+    }
+
+
 def _pipeline_fallback_review(exc: Exception, provider_name: str) -> VLMReview:
     """Last-resort fallback if a provider unexpectedly raises."""
     error_type = type(exc).__name__
@@ -421,6 +513,7 @@ def main() -> int:
     parser.add_argument("--sam2-checkpoint", default=None, help="SAM2 checkpoint path for SAMTracking")
     parser.add_argument("--sam-device", default="cuda")
     parser.add_argument("--sam-iou-threshold", type=float, default=0.10)
+    parser.add_argument("--sam-object-overlap-threshold", type=float, default=0.15)
     parser.add_argument("--sam-window-size", type=int, default=5)
     parser.add_argument("--sam-confirm-count", type=int, default=3)
     parser.add_argument("--sam-use-optical-flow", default="true")
@@ -473,6 +566,7 @@ def main() -> int:
             sam2_checkpoint=args.sam2_checkpoint,
             sam_device=args.sam_device,
             sam_iou_threshold=args.sam_iou_threshold,
+            sam_object_overlap_threshold=args.sam_object_overlap_threshold,
             sam_window_size=args.sam_window_size,
             sam_confirm_count=args.sam_confirm_count,
             sam_use_optical_flow=_parse_bool(args.sam_use_optical_flow),

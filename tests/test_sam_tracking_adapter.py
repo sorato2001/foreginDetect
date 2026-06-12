@@ -21,3 +21,12 @@ def test_sliding_window_confirms_intrusion():
     events = judge.get_events()
     assert len(events) == 1
     assert events[0].peak_iou == 0.3
+
+
+def test_object_overlap_detects_small_object_inside_large_track():
+    judge = SlidingWindowIntrusionJudge(iou_threshold=0.10, object_overlap_threshold=0.15, window_size=3, confirm_count=1)
+
+    state = judge.update(frame_index=1, max_iou=0.02, max_object_overlap=0.8)
+
+    assert state["suspicious"] is True
+    assert state["alarm"] is True

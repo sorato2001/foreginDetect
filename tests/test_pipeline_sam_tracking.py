@@ -27,6 +27,7 @@ class _FakeSAMTrackingAdapter:
                     object_mask_count=1,
                     track_mask_available=True,
                     max_iou=0.2,
+                    max_object_overlap=0.6,
                     suspicious=True,
                     window_count=1,
                     alarm=False,

@@ -28,8 +28,10 @@ def save_pipeline_visualization(
     summary_path = vis_dir / "visualization_summary.json"
 
     summary = {
+        "rule_source": _rule_source(evidence),
         "detector_stage": _detector_summary(evidence),
-        "tracker_stage": _tracker_summary(evidence),
+        "tracker_stage": None if _uses_sam_mask_rule(evidence) else _tracker_summary(evidence),
+        "sam_tracking_stage": _sam_tracking_summary(evidence) if _uses_sam_mask_rule(evidence) else None,
         "rule_stage": [rule.model_dump(mode="json") for rule in evidence.roi_rules],
         "artifacts": {
             "pipeline_overview": str(overview_path),
@@ -43,15 +45,27 @@ def save_pipeline_visualization(
         import numpy as np
 
         rules_config = _load_rules(rules_path)
+        sam_tracking = _load_sam_tracking(evidence)
         image = _load_background(video_path, evidence, cv2, np, image_path=image_path)
-        _draw_rois(image, rules_config, cv2, np)
-        _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
+        if not _uses_sam_mask_rule(evidence):
+            _draw_rois(image, rules_config, cv2, np)
+            _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
+        _draw_sam_tracking_overlay(image, _nearest_sam_frame(sam_tracking, 0), cv2, np)
         _draw_rule_status(image, evidence, cv2)
         cv2.imwrite(str(overview_path), image)
-        annotated = _write_annotated_video(video_path, evidence, rules_config, video_output_path, cv2, np, max_video_frames=max_video_frames)
+        annotated = _write_annotated_video(
+            video_path,
+            evidence,
+            rules_config,
+            video_output_path,
+            cv2,
+            np,
+            max_video_frames=max_video_frames,
+            sam_tracking=sam_tracking,
+        )
         if annotated:
             summary["artifacts"]["annotated_video"] = str(video_output_path)
-        animation = _write_evidence_animation(evidence, rules_config, animation_output_path, cv2, np)
+        animation = _write_evidence_animation(evidence, rules_config, animation_output_path, cv2, np, sam_tracking=sam_tracking)
         if animation:
             summary["artifacts"]["evidence_animation"] = str(animation_output_path)
     except Exception as exc:  # pragma: no cover - visualization should never block pipeline
@@ -82,8 +96,10 @@ def save_image_visualization(
 
     summary = {
         "input_type": "image",
+        "rule_source": _rule_source(evidence),
         "detector_stage": _detector_summary(evidence),
-        "tracker_stage": _tracker_summary(evidence),
+        "tracker_stage": None if _uses_sam_mask_rule(evidence) else _tracker_summary(evidence),
+        "sam_tracking_stage": _sam_tracking_summary(evidence) if _uses_sam_mask_rule(evidence) else None,
         "rule_stage": [rule.model_dump(mode="json") for rule in evidence.roi_rules],
         "artifacts": {"annotated_image": str(annotated_path)},
     }
@@ -94,8 +110,9 @@ def save_image_visualization(
 
         rules_config = _load_rules(rules_path)
         image = _load_background(None, evidence, cv2, np, image_path=image_path)
-        _draw_rois(image, rules_config, cv2, np)
-        _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
+        if not _uses_sam_mask_rule(evidence):
+            _draw_rois(image, rules_config, cv2, np)
+            _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
         _draw_rule_status(image, evidence, cv2)
         cv2.imwrite(str(annotated_path), image)
     except Exception as exc:  # pragma: no cover - visualization should never block pipeline
@@ -141,6 +158,44 @@ def _tracker_summary(evidence: EventEvidence) -> dict[str, Any]:
     }
 
 
+def _sam_tracking_summary(evidence: EventEvidence) -> dict[str, Any] | None:
+    sam_meta = evidence.metadata.get("sam_tracking")
+    if not isinstance(sam_meta, dict):
+        return None
+    return {
+        "artifact": sam_meta.get("artifact"),
+        "degraded": sam_meta.get("degraded"),
+        "processed_frames": sam_meta.get("processed_frames"),
+        "intrusion_events": sam_meta.get("intrusion_events"),
+        "track_mask_seen": sam_meta.get("track_mask_seen"),
+        "detections_seen": sam_meta.get("detections_seen"),
+    }
+
+
+def _load_sam_tracking(evidence: EventEvidence) -> dict[str, Any] | None:
+    sam_meta = evidence.metadata.get("sam_tracking")
+    if not isinstance(sam_meta, dict):
+        return None
+    artifact = sam_meta.get("artifact")
+    if not artifact or not Path(str(artifact)).exists():
+        return None
+    try:
+        import json
+
+        with open(str(artifact), "r", encoding="utf-8") as file_obj:
+            return json.load(file_obj)
+    except Exception:
+        return None
+
+
+def _uses_sam_mask_rule(evidence: EventEvidence) -> bool:
+    return evidence.metadata.get("rule_source") == "sam_tracking_mask_iou"
+
+
+def _rule_source(evidence: EventEvidence) -> str:
+    return str(evidence.metadata.get("rule_source", "config_rules"))
+
+
 def _load_background(video_path: str | None, evidence: EventEvidence, cv2: Any, np: Any, image_path: str | None = None) -> Any:
     if image_path and Path(image_path).exists():
         image = cv2.imread(image_path)
@@ -156,7 +211,7 @@ def _load_background(video_path: str | None, evidence: EventEvidence, cv2: Any, 
     return np.full((height, width, 3), 245, dtype=np.uint8)
 
 
-def _canvas_size(evidence: EventEvidence) -> tuple[int, int]:
+def _canvas_size(evidence: EventEvidence, sam_tracking: dict[str, Any] | None = None) -> tuple[int, int]:
     max_x = 640.0
     max_y = 480.0
     for track in evidence.objects:
@@ -166,6 +221,17 @@ def _canvas_size(evidence: EventEvidence) -> tuple[int, int]:
         for point in track.trajectory:
             max_x = max(max_x, point.x + 80)
             max_y = max(max_y, point.y + 80)
+    if sam_tracking:
+        for frame in (sam_tracking.get("frames") or [])[:200]:
+            for det in frame.get("detections") or []:
+                bbox = det.get("bbox") or []
+                if len(bbox) == 4:
+                    max_x = max(max_x, float(bbox[2]) + 80)
+                    max_y = max(max_y, float(bbox[3]) + 80)
+            for contour in frame.get("track_mask_contours") or []:
+                for x, y in contour:
+                    max_x = max(max_x, float(x) + 80)
+                    max_y = max(max_y, float(y) + 80)
     return int(max_x), int(max_y)
 
 
@@ -236,7 +302,8 @@ def _visible_bboxes(track: ObjectTrack, timestamp: float | None) -> list[Any]:
 
 def _draw_rule_status(image: Any, evidence: EventEvidence, cv2: Any) -> None:
     y = 24
-    cv2.putText(image, "STEAD: detector -> tracker -> ROI/rule engine", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (20, 20, 20), 2)
+    rule_source = _rule_source(evidence)
+    cv2.putText(image, f"STEAD: detector -> tracker -> ROI/rule engine ({rule_source})", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (20, 20, 20), 2)
     y += 28
     cv2.putText(image, f"tracks={len(evidence.objects)} rules={len(evidence.roi_rules)}", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2)
     y += 26
@@ -256,6 +323,7 @@ def _write_annotated_video(
     cv2: Any,
     np: Any,
     max_video_frames: int | None = 300,
+    sam_tracking: dict[str, Any] | None = None,
 ) -> bool:
     """Write a frame-by-frame annotated video when an input video exists."""
     if not video_path or not Path(video_path).exists():
@@ -278,8 +346,10 @@ def _write_annotated_video(
         if not ok:
             break
         timestamp = frame_index / fps if fps > 0 else 0.0
-        _draw_rois(frame, rules_config, cv2, np)
-        _draw_tracks_and_boxes(frame, evidence, cv2, timestamp=timestamp)
+        if not _uses_sam_mask_rule(evidence):
+            _draw_rois(frame, rules_config, cv2, np)
+            _draw_tracks_and_boxes(frame, evidence, cv2, timestamp=timestamp)
+        _draw_sam_tracking_overlay(frame, _nearest_sam_frame(sam_tracking, frame_index), cv2, np)
         _draw_rule_status(frame, evidence, cv2)
         cv2.putText(frame, f"t={timestamp:.2f}s frame={frame_index}", (20, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2)
         writer.write(frame)
@@ -289,9 +359,89 @@ def _write_annotated_video(
     return output_path.exists() and output_path.stat().st_size > 0
 
 
-def _write_evidence_animation(evidence: EventEvidence, rules_config: dict[str, Any], output_path: Path, cv2: Any, np: Any) -> bool:
+def _nearest_sam_frame(sam_tracking: dict[str, Any] | None, frame_index: int) -> dict[str, Any] | None:
+    if not sam_tracking:
+        return None
+    frames = sam_tracking.get("frames") or []
+    if not frames:
+        return None
+    best = None
+    best_gap = 10**9
+    for item in frames:
+        idx = int(item.get("frame_index", 0))
+        gap = abs(idx - frame_index)
+        if gap < best_gap:
+            best = item
+            best_gap = gap
+        if idx > frame_index and gap > best_gap:
+            break
+    return best
+
+
+def _draw_sam_tracking_overlay(image: Any, sam_frame: dict[str, Any] | None, cv2: Any, np: Any) -> None:
+    """Overlay SAMTracking masks, detections, and intrusion status."""
+    if not sam_frame:
+        return
+    overlay = image.copy()
+    track_contours = sam_frame.get("track_mask_contours") or []
+    for contour in track_contours:
+        pts = np.array(contour, dtype=np.int32)
+        if len(pts) >= 3:
+            cv2.fillPoly(overlay, [pts], (90, 80, 20))
+            cv2.polylines(image, [pts], True, (120, 90, 20), 3)
+    object_contours = sam_frame.get("object_mask_contours") or []
+    for contour_group in object_contours:
+        for contour in contour_group:
+            pts = np.array(contour, dtype=np.int32)
+            if len(pts) >= 3:
+                cv2.fillPoly(overlay, [pts], (0, 0, 220))
+                cv2.polylines(image, [pts], True, (0, 0, 255), 2)
+    cv2.addWeighted(overlay, 0.35, image, 0.65, 0, image)
+
+    for det in sam_frame.get("detections") or []:
+        bbox = det.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        color = (0, 0, 255) if sam_frame.get("alarm") else (0, 180, 255) if sam_frame.get("suspicious") else (0, 200, 0)
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 3)
+        label = f"{det.get('label', 'obj')} {float(det.get('confidence', 0.0)):.2f}"
+        cv2.putText(image, label, (x1, max(28, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    h, w = image.shape[:2]
+    alarm = bool(sam_frame.get("alarm"))
+    suspicious = bool(sam_frame.get("suspicious"))
+    max_iou = float(sam_frame.get("max_iou", 0.0))
+    max_object_overlap = float(sam_frame.get("max_object_overlap", 0.0))
+    window_count = int(sam_frame.get("window_count", 0))
+    status = "ALARM" if alarm else "SUSPICIOUS" if suspicious else "NORMAL"
+    color = (0, 0, 255) if alarm else (0, 180, 255) if suspicious else (0, 180, 0)
+    if alarm:
+        cv2.rectangle(image, (0, 0), (w - 1, h - 1), color, 8)
+    cv2.rectangle(image, (12, h - 76), (min(w - 12, 720), h - 14), (20, 20, 20), -1)
+    cv2.putText(
+        image,
+        f"SAMTracking {status} | MaskIoU={max_iou:.3f} | ObjOverlap={max_object_overlap:.3f} | Window={window_count}",
+        (24, h - 36),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        color,
+        2,
+    )
+    if track_contours:
+        cv2.putText(image, "railway track mask", (24, h - 94), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 90, 20), 2)
+
+
+def _write_evidence_animation(
+    evidence: EventEvidence,
+    rules_config: dict[str, Any],
+    output_path: Path,
+    cv2: Any,
+    np: Any,
+    sam_tracking: dict[str, Any] | None = None,
+) -> bool:
     """Write a short synthetic animation from structured evidence."""
-    width, height = _canvas_size(evidence)
+    width, height = _canvas_size(evidence, sam_tracking=sam_tracking)
     fps = 6.0
     duration = max(float(evidence.time_range[1] - evidence.time_range[0]), 1.0)
     frame_count = max(6, int(duration * fps))
@@ -299,13 +449,24 @@ def _write_evidence_animation(evidence: EventEvidence, rules_config: dict[str, A
     for frame_idx in range(frame_count):
         timestamp = evidence.time_range[0] + (duration * frame_idx / max(1, frame_count - 1))
         frame = np.full((height, width, 3), 245, dtype=np.uint8)
-        _draw_rois(frame, rules_config, cv2, np)
-        _draw_tracks_and_boxes(frame, evidence, cv2, timestamp=timestamp)
+        if _uses_sam_mask_rule(evidence):
+            source_frame_index = _frame_index_for_timestamp(sam_tracking, timestamp)
+            _draw_sam_tracking_overlay(frame, _nearest_sam_frame(sam_tracking, source_frame_index), cv2, np)
+        else:
+            _draw_rois(frame, rules_config, cv2, np)
+            _draw_tracks_and_boxes(frame, evidence, cv2, timestamp=timestamp)
         _draw_rule_status(frame, evidence, cv2)
         cv2.putText(frame, f"evidence animation t={timestamp:.2f}s", (20, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2)
         writer.write(frame)
     writer.release()
     return output_path.exists() and output_path.stat().st_size > 0
+
+
+def _frame_index_for_timestamp(sam_tracking: dict[str, Any] | None, timestamp: float) -> int:
+    if not sam_tracking:
+        return 0
+    fps = float(sam_tracking.get("fps") or 25.0)
+    return int(round(timestamp * fps))
 
 
 def _save_json(data: dict[str, Any], path: Path) -> None:
