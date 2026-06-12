@@ -96,16 +96,13 @@ python -m src.pipeline.analyze_event \
   --output outputs/sam_tracking_demo \
   --vlm-provider mock \
   --tracker sam_tracking \
-  --sam-object-model ../RailwayIntrusion_Tracking_SAM2/weights/yolo11l.pt \
-  --sam-track-model ../RailwayIntrusion_Tracking_SAM2/weights/best.pt \
-  --sam2-config ../RailwayIntrusion_Tracking_SAM2/sam2_hiera_l.yaml \
-  --sam2-checkpoint ../RailwayIntrusion_Tracking_SAM2/weights/sam2_hiera_large.pt \
+  --sam-object-model weights/yolo11l.pt \
+  --sam-track-model weights/best.pt \
+  --sam2-config sam2_hiera_l.yaml \
+  --sam2-checkpoint weights/sam2_hiera_large.pt \
   --sam-iou-threshold 0.10 \
   --sam-window-size 5 \
   --sam-confirm-count 3 \
-  --sam-sample-every 15 \
-  --sam-track-mask-interval 30 \
-  --sam-imgsz 640 \
   --max-analysis-frames 60 \
   --visualization-max-frames 60
 ```
@@ -261,33 +258,7 @@ Useful CLI switches:
 --sam-window-size 5
 --sam-confirm-count 3
 --sam-use-optical-flow true
---sam-sample-every 15
---sam-track-mask-interval 30
---sam-imgsz 640
 ```
-
-For first-time debugging, avoid full-video heavy inference:
-
-```bash
-python -m src.pipeline.analyze_event \
-  --input-type video \
-  --video examples/test_h264.mp4 \
-  --camera-id cam02 \
-  --rules configs/rules.image.yaml \
-  --output outputs/sam_tracking_fast_check \
-  --vlm-provider mock \
-  --track sam_tracking \
-  --sam-object-model weights/yolo11l.pt \
-  --sam-track-model weights/best.pt \
-  --max-analysis-frames 60 \
-  --no-visualization \
-  --sam-device cpu \
-  --sam-progress-interval 1
-```
-
-`--max-analysis-frames 0` and `--visualization-max-frames 0` mean full video.
-With YOLO11l plus track segmentation this can be slow on CPU, especially for
-large videos.
 
 ## Logs
 
@@ -345,3 +316,11 @@ pytest -q
 Do not commit `.env`, API keys, camera accounts, RTSP passwords, private videos,
 database files, or generated outputs. If a secret was ever committed in another
 branch or shared externally, rotate it before deployment.
+
+##
+
+```bash
+ python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda 
+
+ python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
+ ```

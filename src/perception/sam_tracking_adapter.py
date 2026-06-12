@@ -16,6 +16,7 @@ masks so the rest of the STEAD demo still runs and records a degraded status.
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -213,7 +214,10 @@ class SAMTrackingAdapter:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         sample_every = max(1, int(self.config.sample_every))
-        track_mask_interval = max(1, int(self.config.track_mask_interval))
+        track_mask_interval = int(self.config.track_mask_interval)
+        track_mask_enabled = track_mask_interval > 0
+        if track_mask_enabled:
+            track_mask_interval = max(1, track_mask_interval)
         tracker = SimpleIOUTracker(iou_threshold=0.3)
         judge = SlidingWindowIntrusionJudge(
             iou_threshold=self.config.iou_threshold,
@@ -227,13 +231,14 @@ class SAMTrackingAdapter:
         detection_seen = False
         cached_track_mask: Any | None = None
         logger.info(
-            "SAMTracking analyze start: video=%s fps=%.3f total_frames=%s max_frames=%s sample_every=%s track_mask_interval=%s device=%s imgsz=%s",
+            "SAMTracking analyze start: video=%s fps=%.3f total_frames=%s max_frames=%s sample_every=%s track_mask_interval=%s track_mask_enabled=%s device=%s imgsz=%s",
             video_path,
             fps,
             total_frames,
             max_frames,
             sample_every,
             track_mask_interval,
+            track_mask_enabled,
             self._runtime_device,
             self.config.imgsz,
         )
@@ -252,7 +257,7 @@ class SAMTrackingAdapter:
             detections = self.detect_objects(frame, frame_index, timestamp)
             detection_seen = detection_seen or bool(detections)
             tracks = tracker.update(detections)
-            if cached_track_mask is None or frame_index % track_mask_interval == 0:
+            if track_mask_enabled and (cached_track_mask is None or frame_index % track_mask_interval == 0):
                 cached_track_mask = self.detect_track_mask(frame)
             track_mask = cached_track_mask
             track_mask_seen = track_mask_seen or bool(track_mask is not None and np.asarray(track_mask).sum() > 0)
@@ -298,6 +303,7 @@ class SAMTrackingAdapter:
                 "total_frames": total_frames,
                 "sample_every": sample_every,
                 "track_mask_interval": track_mask_interval,
+                "track_mask_enabled": track_mask_enabled,
                 "track_mask_seen": track_mask_seen,
                 "detections_seen": detection_seen,
                 "fallback_to_bbox_mask": self.config.fallback_to_bbox_mask,
@@ -318,6 +324,8 @@ class SAMTrackingAdapter:
         if self._object_model is None:
             return []
         try:
+            start = time.perf_counter()
+            logger.info("SAMTracking object predict start: frame=%s device=%s imgsz=%s", frame_index, self._runtime_device, self.config.imgsz)
             results = self._object_model.predict(
                 source=frame,
                 conf=self.config.conf_threshold,
@@ -325,6 +333,7 @@ class SAMTrackingAdapter:
                 device=self._runtime_device,
                 verbose=False,
             )
+            logger.info("SAMTracking object predict done: frame=%s elapsed=%.3fs", frame_index, time.perf_counter() - start)
         except Exception as exc:
             logger.warning("SAMTracking object detection failed: %s", exc)
             return []
@@ -350,6 +359,8 @@ class SAMTrackingAdapter:
             import cv2
             import numpy as np
 
+            start = time.perf_counter()
+            logger.info("SAMTracking track-mask predict start: device=%s imgsz=%s", self._runtime_device, self.config.imgsz)
             results = self._track_model.predict(
                 source=frame,
                 conf=self.config.conf_threshold,
@@ -357,6 +368,7 @@ class SAMTrackingAdapter:
                 device=self._runtime_device,
                 verbose=False,
             )
+            logger.info("SAMTracking track-mask predict done: elapsed=%.3fs", time.perf_counter() - start)
             if not results or getattr(results[0], "masks", None) is None or results[0].masks is None:
                 return None
             masks = results[0].masks.data
@@ -455,13 +467,15 @@ class SAMTrackingAdapter:
     @staticmethod
     def _resolve_device(requested: str) -> str:
         """Use CPU automatically when CUDA is requested but unavailable."""
-        if requested.lower().startswith("cuda"):
+        value = (requested or "cpu").strip().lower()
+        if value in {"gpu", "cuda", "cuda:0", "0"}:
             try:
                 import torch
 
                 if not torch.cuda.is_available():
                     logger.warning("SAMTracking requested CUDA but CUDA is unavailable; using CPU")
                     return "cpu"
+                return "cuda:0"
             except Exception:
                 logger.warning("SAMTracking cannot check CUDA availability; using CPU")
                 return "cpu"
