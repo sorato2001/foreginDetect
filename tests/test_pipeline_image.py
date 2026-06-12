@@ -28,3 +28,5 @@ def test_image_pipeline_with_mock_detections(tmp_path):
     assert Path(result["pipeline_log"]).exists()
     assert Path(result["visualization"]["annotated_image"]).exists()
     assert "annotated_video" not in result["visualization"]
+    evidence_text = Path(result["event_evidence"]).read_text(encoding="utf-8")
+    assert "input_image" in evidence_text

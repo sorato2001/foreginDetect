@@ -14,6 +14,7 @@ from typing import Any
 from src.alarm.alarm_engine import AlarmEngine
 from src.config.settings import ensure_output_dir
 from src.evidence.evidence_builder import build_object_tracks, empty_evidence
+from src.evidence.evidence_schema import KeyframeInfo
 from src.evidence.serializers import save_json, save_model
 from src.evidence.window_builder import WindowBuilder
 from src.perception.detector import Detection
@@ -96,6 +97,23 @@ def run_image_pipeline(
     logger.info("STEP 03 evidence: build single-image evidence")
     evidence = empty_evidence(event_id, camera_id, image_path, duration=1.0, fps=None)
     evidence.objects = build_object_tracks(tracks)
+    evidence.keyframes = [
+        KeyframeInfo(
+            timestamp=0.0,
+            frame_path=image_path,
+            reason="input_image",
+            boxes=[
+                {
+                    "track_id": track_id,
+                    "label": detection.label,
+                    "confidence": detection.confidence,
+                    "bbox": detection.bbox,
+                }
+                for track_id, history in tracks.items()
+                for detection in history
+            ],
+        )
+    ]
     evidence.metadata.update({"input_type": "image", "mock_detections": mock_detections, "stead_version": "stead_v1"})
     logger.info("STEP 03 evidence: done objects=%s elapsed=%.3fs", len(evidence.objects), time.perf_counter() - step_start)
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import base64
+import mimetypes
 import os
 import time
 from datetime import datetime, timezone
@@ -133,11 +135,35 @@ class QwenProvider(VLMReviewProvider):
 
     def _payload(self, evidence: EventEvidence) -> dict[str, Any]:
         """Build DashScope compatible chat payload."""
+        prompt = build_review_prompt(evidence)
+        image_url = self._first_keyframe_data_url(evidence)
+        content: str | list[dict[str, Any]]
+        if image_url:
+            content = [
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": prompt},
+            ]
+            logger.info("Qwen payload: using multimodal image+text review")
+        else:
+            content = prompt
+            logger.info("Qwen payload: using text-only structured evidence review")
         return {
             "model": self.model,
-            "messages": [{"role": "user", "content": build_review_prompt(evidence)}],
+            "messages": [{"role": "user", "content": content}],
             "temperature": 0.0,
         }
+
+    @staticmethod
+    def _first_keyframe_data_url(evidence: EventEvidence) -> str | None:
+        """Return the first local keyframe encoded as a data URL."""
+        for keyframe in evidence.keyframes:
+            path = Path(keyframe.frame_path)
+            if not path.exists() or not path.is_file():
+                continue
+            mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+            data = base64.b64encode(path.read_bytes()).decode("ascii")
+            return f"data:{mime};base64,{data}"
+        return None
 
     def _base_metadata(self, success: bool, retry_count: int, fallback: bool) -> dict[str, Any]:
         """Return metadata without secrets."""

@@ -22,10 +22,15 @@ class AlarmEngine:
         final_score = 0.55 * rule_score + 0.45 * vlm_score
         if review.possible_false_alarm:
             final_score *= 0.6
-        if not self._has_continuous_track(evidence):
+        if not self._is_image_evidence(evidence) and not self._has_continuous_track(evidence):
             final_score *= 0.7
         final_score = max(0.0, min(1.0, final_score))
         final_level = self._level(final_score)
+        if self._is_image_evidence(evidence) and review.is_anomaly and not review.possible_false_alarm:
+            if review.alarm_level_suggestion == "high" and review.confidence >= 0.75:
+                final_level = self._max_level(final_level, "medium")
+            elif review.alarm_level_suggestion == "medium" and review.confidence >= 0.65:
+                final_level = self._max_level(final_level, "medium")
         is_alarm = final_level in {"medium", "high"}
         reasons = self._reasons(triggered, review, final_score)
         uncertainty = max(0.0, min(1.0, 1.0 - max(rule_score, vlm_score)))
@@ -53,6 +58,15 @@ class AlarmEngine:
     @staticmethod
     def _has_continuous_track(evidence: EventEvidence) -> bool:
         return any(len(track.trajectory) >= 2 or len(track.bboxes) >= 2 for track in evidence.objects)
+
+    @staticmethod
+    def _is_image_evidence(evidence: EventEvidence) -> bool:
+        return evidence.metadata.get("input_type") == "image"
+
+    @staticmethod
+    def _max_level(left: str, right: str) -> str:
+        order = {"none": 0, "low": 1, "medium": 2, "high": 3}
+        return left if order[left] >= order[right] else right
 
     @staticmethod
     def _level(score: float) -> str:
@@ -87,6 +101,8 @@ class AlarmEngine:
                 reasons.append("Final alarm level is based on rule_score only or conservative fallback.")
             else:
                 reasons.append("No rule was triggered; Qwen failure does not mean Qwen judged the event normal.")
+        if review.metadata.get("provider") == "qwen" and review.metadata.get("success") and review.is_anomaly:
+            reasons.append("Qwen image/text review reported anomaly evidence.")
         reasons.append(f"VLM: {review.reason}")
         reasons.append(f"Final fused score={final_score:.3f}.")
         return reasons

@@ -10,6 +10,7 @@ from src.evidence.evidence_schema import EventEvidence, ObjectTrack
 SYSTEM_PROMPT = """You are a surveillance anomaly review model.
 Only judge from the provided structured evidence and keyframe paths.
 Do not infer information outside the evidence.
+If an image is provided, inspect the image directly, especially when detector results are empty.
 Return JSON only. If evidence is insufficient, lower confidence.
 Keep the JSON short. Do not include long explanations.
 """
