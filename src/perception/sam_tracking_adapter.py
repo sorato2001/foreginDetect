@@ -406,6 +406,93 @@ class SAMTrackingAdapter:
             metadata=metadata,
         )
 
+    def analyze_image(self, image_path: str) -> SAMTrackingResult:
+        """Analyze one image with the same object/track-mask intrusion logic."""
+        try:
+            import cv2
+            import numpy as np
+        except Exception as exc:
+            logger.warning("SAMTracking unavailable because OpenCV/numpy import failed: %s", exc)
+            return SAMTrackingResult(
+                tracks={},
+                fps=0.0,
+                duration=1.0,
+                metadata=self._metadata(degraded=True, error=f"{type(exc).__name__}: {exc}"),
+            )
+
+        frame = cv2.imread(image_path)
+        if frame is None:
+            logger.warning("SAMTracking cannot read image=%s", image_path)
+            return SAMTrackingResult(
+                tracks={},
+                fps=0.0,
+                duration=1.0,
+                metadata=self._metadata(degraded=True, error="cannot_read_image"),
+            )
+
+        frame_index = 0
+        timestamp = 0.0
+        detections = self.detect_objects(frame, frame_index, timestamp)
+        tracks = {track_id + 1: [det] for track_id, det in enumerate(detections)}
+        track_mask = self.detect_track_mask(frame)
+        object_ids = list(tracks.keys())
+        object_masks = self.segment_objects(frame, detections, frame_index=frame_index, object_ids=object_ids)
+        judge = SlidingWindowIntrusionJudge(
+            iou_threshold=self.config.iou_threshold,
+            object_overlap_threshold=self.config.object_overlap_threshold,
+            window_size=1,
+            confirm_count=1,
+        )
+        track_mask_seen = bool(track_mask is not None and np.asarray(track_mask).sum() > 0)
+        detection_seen = bool(detections)
+        if track_mask is not None:
+            max_iou = max((judge.compute_iou(mask, track_mask) for mask in object_masks), default=0.0)
+            max_object_overlap = max((judge.compute_object_overlap(mask, track_mask) for mask in object_masks), default=0.0)
+        else:
+            max_iou = 0.0
+            max_object_overlap = 0.0
+        state = judge.update(frame_index, max_iou, max_object_overlap=max_object_overlap)
+        frames = [
+            SAMFrameResult(
+                frame_index=frame_index,
+                timestamp=timestamp,
+                detections=[_detection_to_dict(det) for det in detections],
+                object_mask_count=len(object_masks),
+                track_mask_available=track_mask_seen,
+                max_iou=max_iou,
+                max_object_overlap=max_object_overlap,
+                suspicious=bool(state["suspicious"]),
+                window_count=int(state["window_count"]),
+                alarm=bool(state["alarm"]),
+                track_mask_contours=mask_to_contours(track_mask) if track_mask is not None else [],
+                object_mask_contours=[mask_to_contours(mask) for mask in object_masks],
+            )
+        ]
+        degraded = self._object_model is None or self._track_model is None
+        metadata = self._metadata(degraded=degraded)
+        metadata.update(
+            {
+                "input_type": "image",
+                "processed_frames": 1,
+                "total_frames": 1,
+                "sample_every": 1,
+                "track_mask_interval": 1,
+                "track_mask_enabled": True,
+                "track_mask_seen": track_mask_seen,
+                "detections_seen": detection_seen,
+                "fallback_to_bbox_mask": self.config.fallback_to_bbox_mask,
+                "sam2_mode": "single_image_bbox_or_static_mask",
+            }
+        )
+        return SAMTrackingResult(
+            tracks=tracks,
+            fps=0.0,
+            duration=1.0,
+            frames=frames,
+            intrusion_events=judge.get_events(),
+            metadata=metadata,
+        )
+
     def detect_objects(self, frame: Any, frame_index: int, timestamp: float) -> list[Detection]:
         """Detect person/cow/sheep with YOLO when available."""
         if self._object_model is None:

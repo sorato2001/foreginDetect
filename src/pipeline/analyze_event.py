@@ -549,6 +549,13 @@ def main() -> int:
             vlm_fallback_on_error=_parse_bool(args.vlm_fallback_on_error),
             save_visualization=not args.no_visualization,
             log_level=args.log_level,
+            tracker=args.tracker,
+            sam_object_model=args.sam_object_model,
+            sam_track_model=args.sam_track_model,
+            sam_device=args.sam_device,
+            sam_iou_threshold=args.sam_iou_threshold,
+            sam_object_overlap_threshold=args.sam_object_overlap_threshold,
+            sam_imgsz=args.sam_imgsz,
         )
     else:
         if not args.video:

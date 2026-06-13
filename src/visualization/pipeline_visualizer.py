@@ -109,10 +109,12 @@ def save_image_visualization(
         import numpy as np
 
         rules_config = _load_rules(rules_path)
+        sam_tracking = _load_sam_tracking(evidence)
         image = _load_background(None, evidence, cv2, np, image_path=image_path)
         if not _uses_sam_mask_rule(evidence):
             _draw_rois(image, rules_config, cv2, np)
             _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
+        _draw_sam_tracking_overlay(image, _nearest_sam_frame(sam_tracking, 0), cv2, np)
         _draw_rule_status(image, evidence, cv2)
         cv2.imwrite(str(annotated_path), image)
     except Exception as exc:  # pragma: no cover - visualization should never block pipeline

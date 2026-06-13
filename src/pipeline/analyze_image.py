@@ -18,8 +18,15 @@ from src.evidence.evidence_schema import KeyframeInfo
 from src.evidence.serializers import save_json, save_model
 from src.evidence.window_builder import WindowBuilder
 from src.perception.detector import Detection
+from src.perception.sam_tracking_adapter import SAMTrackingAdapter, SAMTrackingConfig, SAMTrackingResult
 from src.perception.yolo_detector import YoloDetector
-from src.pipeline.analyze_event import _configure_pipeline_logging, _pipeline_fallback_review, logger
+from src.pipeline.analyze_event import (
+    _configure_pipeline_logging,
+    _pipeline_fallback_review,
+    _sam_tracking_mask_iou_rule,
+    _sam_tracking_prompt_summary,
+    logger,
+)
 from src.rules.rule_engine import RuleEngine
 from src.vlm.mock_provider import MockVLMProvider
 from src.vlm.qwen_provider import QwenProvider
@@ -53,6 +60,12 @@ def _detect_image(image_path: str, mock_detections: bool = False) -> dict[int, l
     return {idx + 1: [detection] for idx, detection in enumerate(detections)}
 
 
+def _detect_image_with_sam_tracking(image_path: str, config: SAMTrackingConfig) -> SAMTrackingResult:
+    """Run SAMTracking's single-image railway intrusion logic."""
+    adapter = SAMTrackingAdapter(config)
+    return adapter.analyze_image(image_path)
+
+
 def run_image_pipeline(
     image_path: str,
     camera_id: str,
@@ -66,6 +79,13 @@ def run_image_pipeline(
     vlm_fallback_on_error: bool = True,
     save_visualization: bool = True,
     log_level: str = "INFO",
+    tracker: str = "simple_iou",
+    sam_object_model: str | None = None,
+    sam_track_model: str | None = None,
+    sam_device: str = "cuda",
+    sam_iou_threshold: float = 0.10,
+    sam_object_overlap_threshold: float = 0.15,
+    sam_imgsz: int = 640,
 ) -> dict[str, Any]:
     """Run STEAD analysis on a single image and write standard artifacts."""
     event_id = event_id or f"image_{uuid.uuid4().hex[:8]}"
@@ -80,14 +100,41 @@ def run_image_pipeline(
         out,
         vlm_provider,
     )
-    logger.info("STEP 01 config: rules=%s mock_detections=%s save_visualization=%s", rules_path, mock_detections, save_visualization)
+    logger.info(
+        "STEP 01 config: rules=%s tracker=%s mock_detections=%s save_visualization=%s",
+        rules_path,
+        tracker,
+        mock_detections,
+        save_visualization,
+    )
 
     step_start = time.perf_counter()
-    logger.info("STEP 02 detector/tracker: begin image detection")
-    tracks = _detect_image(image_path, mock_detections=mock_detections)
+    logger.info("STEP 02 detector/tracker: begin image detection tracker=%s", tracker)
+    sam_tracking_result: SAMTrackingResult | None = None
+    if tracker == "sam_tracking" and not mock_detections:
+        sam_config = SAMTrackingConfig(
+            object_model_path=sam_object_model or SAMTrackingConfig().object_model_path,
+            track_model_path=sam_track_model or SAMTrackingConfig().track_model_path,
+            device=sam_device,
+            iou_threshold=sam_iou_threshold,
+            object_overlap_threshold=sam_object_overlap_threshold,
+            window_size=1,
+            confirm_count=1,
+            sam2_enabled=False,
+            sample_every=1,
+            track_mask_interval=1,
+            imgsz=sam_imgsz,
+        )
+        sam_tracking_result = _detect_image_with_sam_tracking(image_path, sam_config)
+        tracks = sam_tracking_result.tracks
+    else:
+        if tracker == "sam_tracking" and mock_detections:
+            logger.info("STEP 02 detector/tracker: mock_detections requested; using deterministic image tracks instead of SAMTracking")
+        tracks = _detect_image(image_path, mock_detections=mock_detections)
     detection_count = sum(len(history) for history in tracks.values())
     logger.info(
-        "STEP 02 detector/tracker: done tracks=%s detections=%s elapsed=%.3fs",
+        "STEP 02 detector/tracker: done tracker=%s tracks=%s detections=%s elapsed=%.3fs",
+        tracker,
         len(tracks),
         detection_count,
         time.perf_counter() - step_start,
@@ -120,7 +167,16 @@ def run_image_pipeline(
     step_start = time.perf_counter()
     logger.info("STEP 04 ROI/rules: load rules and evaluate")
     rule_engine = RuleEngine.from_yaml(rules_path)
-    evidence.roi_rules = rule_engine.evaluate(evidence)
+    sam_rule = _sam_tracking_mask_iou_rule(sam_tracking_result)
+    if sam_rule is not None:
+        evidence.roi_rules = [sam_rule]
+        evidence.metadata["rule_source"] = "sam_tracking_mask_iou"
+        logger.info("STEP 04 ROI/rules: using SAMTracking mask IoU rule because track mask is available")
+    else:
+        evidence.roi_rules = rule_engine.evaluate(evidence)
+        evidence.metadata["rule_source"] = "config_rules"
+        if tracker == "sam_tracking":
+            logger.info("STEP 04 ROI/rules: SAMTracking track mask unavailable; fallback to config rules")
     triggered_rules = [rule.rule_id for rule in evidence.roi_rules if rule.triggered]
     logger.info(
         "STEP 04 ROI/rules: done rules=%s triggered=%s elapsed=%.3fs",
@@ -131,6 +187,25 @@ def run_image_pipeline(
 
     step_start = time.perf_counter()
     logger.info("STEP 05 windows: build image window")
+    sam_tracking_artifact: str | None = None
+    if sam_tracking_result is not None:
+        sam_tracking_artifact = str(out / "sam_tracking_result.json")
+        save_json(sam_tracking_result.to_json_dict(), sam_tracking_artifact)
+        evidence.metadata["sam_tracking"] = {
+            "artifact": sam_tracking_artifact,
+            "degraded": sam_tracking_result.metadata.get("degraded"),
+            "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
+            "intrusion_events": len(sam_tracking_result.intrusion_events),
+            "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
+            "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
+            "summary": _sam_tracking_prompt_summary(sam_tracking_result),
+        }
+        logger.info(
+            "STEP 05 windows: SAMTracking artifact=%s degraded=%s intrusion_events=%s",
+            sam_tracking_artifact,
+            sam_tracking_result.metadata.get("degraded"),
+            len(sam_tracking_result.intrusion_events),
+        )
     evidence.windows = WindowBuilder(window_size=1.0, stride=1.0).build(evidence)
     logger.info("STEP 05 windows: done windows=%s elapsed=%.3fs", len(evidence.windows), time.perf_counter() - step_start)
 
@@ -222,6 +297,7 @@ def run_image_pipeline(
         "alarm_result": str(out / "alarm_result.json"),
         "visualization": visualization_artifacts,
         "pipeline_log": log_path,
+        "sam_tracking_result": sam_tracking_artifact,
         "final_level": alarm.final_level,
         "is_alarm": alarm.is_alarm,
     }
