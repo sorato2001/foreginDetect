@@ -6,6 +6,7 @@ import numpy as np
 from src.perception.detector import Detection
 from src.perception.sam_tracking_adapter import SAMFrameResult, SAMTrackingResult
 from src.pipeline.analyze_image import run_image_pipeline
+from src.pipeline.analyze_image import run_image_batch_pipeline
 from src.pipeline import analyze_image
 
 
@@ -88,3 +89,26 @@ def test_image_pipeline_can_use_sam_tracking_rule(monkeypatch, tmp_path):
     evidence_text = Path(result["event_evidence"]).read_text(encoding="utf-8")
     assert "sam_tracking_mask_iou" in evidence_text
     assert "sam_tracking" in evidence_text
+
+
+def test_image_batch_pipeline_writes_summary(tmp_path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    for name in ["a.jpg", "b.png"]:
+        cv2.imwrite(str(image_dir / name), np.full((240, 320, 3), 245, dtype=np.uint8))
+    output = tmp_path / "batch"
+
+    result = run_image_batch_pipeline(
+        image_path=str(image_dir),
+        camera_id="cam_img",
+        rules_path="configs/rules.example.yaml",
+        output_dir=str(output),
+        vlm_provider="mock",
+        mock_detections=True,
+    )
+
+    assert result["input_type"] == "image_batch"
+    assert result["total"] == 2
+    assert result["succeeded"] == 2
+    assert Path(result["summary_json"]).exists()
+    assert all(Path(item["event_evidence"]).exists() for item in result["results"])

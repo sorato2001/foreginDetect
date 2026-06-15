@@ -36,6 +36,13 @@ def _parse_bool(value: str | bool) -> bool:
     return value.lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _parse_csv(value: str | None) -> list[str]:
+    """Parse comma-separated CLI labels."""
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def _fake_tracks() -> dict[int, list[Detection]]:
     """Return deterministic tracks for smoke tests and offline demos."""
     return {
@@ -143,6 +150,7 @@ def run_pipeline(
     tracker: str = "simple_iou",
     sam_object_model: str | None = None,
     sam_track_model: str | None = None,
+    sam_track_labels: list[str] | None = None,
     sam2_config: str | None = None,
     sam2_checkpoint: str | None = None,
     sam_device: str = "cuda",
@@ -189,6 +197,7 @@ def run_pipeline(
         sam_config = SAMTrackingConfig(
             object_model_path=sam_object_model or SAMTrackingConfig().object_model_path,
             track_model_path=sam_track_model or SAMTrackingConfig().track_model_path,
+            track_mask_labels=sam_track_labels or [],
             sam2_config=sam2_config,
             sam2_checkpoint=sam2_checkpoint,
             device=sam_device,
@@ -499,6 +508,8 @@ def main() -> int:
     parser.add_argument("--input-type", choices=["video", "image"], default="video")
     parser.add_argument("--video", default=None)
     parser.add_argument("--image", default=None)
+    parser.add_argument("--recursive", action="store_true", help="For image input directories, scan subdirectories")
+    parser.add_argument("--batch-limit", type=int, default=0, help="For image input directories, limit number of images; 0 means no limit")
     parser.add_argument("--camera-id", required=True)
     parser.add_argument("--rules", default="configs/rules.example.yaml")
     parser.add_argument("--output", required=True)
@@ -515,6 +526,7 @@ def main() -> int:
     parser.add_argument("--tracker", "--track", dest="tracker", choices=["simple_iou", "sam_tracking"], default="simple_iou")
     parser.add_argument("--sam-object-model", default=None, help="YOLO11 object model path for SAMTracking")
     parser.add_argument("--sam-track-model", default=None, help="Rail/track segmentation best.pt path for SAMTracking")
+    parser.add_argument("--sam-track-labels", default=None, help="Comma-separated segmentation labels to merge as railway/track mask")
     parser.add_argument("--sam2-config", default=None, help="SAM2 config path for SAMTracking")
     parser.add_argument("--sam2-checkpoint", default=None, help="SAM2 checkpoint path for SAMTracking")
     parser.add_argument("--sam-device", default="cuda")
@@ -534,29 +546,58 @@ def main() -> int:
     if args.input_type == "image":
         if not args.image:
             parser.error("--image is required when --input-type image")
-        from src.pipeline.analyze_image import run_image_pipeline
+        image_source = Path(args.image)
+        if image_source.is_dir():
+            from src.pipeline.analyze_image import run_image_batch_pipeline
 
-        result = run_image_pipeline(
-            image_path=args.image,
-            camera_id=args.camera_id,
-            rules_path=args.rules,
-            output_dir=args.output,
-            vlm_provider=args.vlm_provider,
-            event_id=args.event_id,
-            mock_detections=args.mock_detections,
-            vlm_timeout=args.vlm_timeout,
-            vlm_max_retries=args.vlm_max_retries,
-            vlm_fallback_on_error=_parse_bool(args.vlm_fallback_on_error),
-            save_visualization=not args.no_visualization,
-            log_level=args.log_level,
-            tracker=args.tracker,
-            sam_object_model=args.sam_object_model,
-            sam_track_model=args.sam_track_model,
-            sam_device=args.sam_device,
-            sam_iou_threshold=args.sam_iou_threshold,
-            sam_object_overlap_threshold=args.sam_object_overlap_threshold,
-            sam_imgsz=args.sam_imgsz,
-        )
+            result = run_image_batch_pipeline(
+                image_path=args.image,
+                camera_id=args.camera_id,
+                rules_path=args.rules,
+                output_dir=args.output,
+                vlm_provider=args.vlm_provider,
+                mock_detections=args.mock_detections,
+                vlm_timeout=args.vlm_timeout,
+                vlm_max_retries=args.vlm_max_retries,
+                vlm_fallback_on_error=_parse_bool(args.vlm_fallback_on_error),
+                save_visualization=not args.no_visualization,
+                log_level=args.log_level,
+                tracker=args.tracker,
+                sam_object_model=args.sam_object_model,
+                sam_track_model=args.sam_track_model,
+                sam_track_labels=_parse_csv(args.sam_track_labels),
+                sam_device=args.sam_device,
+                sam_iou_threshold=args.sam_iou_threshold,
+                sam_object_overlap_threshold=args.sam_object_overlap_threshold,
+                sam_imgsz=args.sam_imgsz,
+                recursive=args.recursive,
+                limit=args.batch_limit or None,
+            )
+        else:
+            from src.pipeline.analyze_image import run_image_pipeline
+
+            result = run_image_pipeline(
+                image_path=args.image,
+                camera_id=args.camera_id,
+                rules_path=args.rules,
+                output_dir=args.output,
+                vlm_provider=args.vlm_provider,
+                event_id=args.event_id,
+                mock_detections=args.mock_detections,
+                vlm_timeout=args.vlm_timeout,
+                vlm_max_retries=args.vlm_max_retries,
+                vlm_fallback_on_error=_parse_bool(args.vlm_fallback_on_error),
+                save_visualization=not args.no_visualization,
+                log_level=args.log_level,
+                tracker=args.tracker,
+                sam_object_model=args.sam_object_model,
+                sam_track_model=args.sam_track_model,
+                sam_track_labels=_parse_csv(args.sam_track_labels),
+                sam_device=args.sam_device,
+                sam_iou_threshold=args.sam_iou_threshold,
+                sam_object_overlap_threshold=args.sam_object_overlap_threshold,
+                sam_imgsz=args.sam_imgsz,
+            )
     else:
         if not args.video:
             parser.error("--video is required when --input-type video")
@@ -578,6 +619,7 @@ def main() -> int:
             tracker=args.tracker,
             sam_object_model=args.sam_object_model,
             sam_track_model=args.sam_track_model,
+            sam_track_labels=_parse_csv(args.sam_track_labels),
             sam2_config=args.sam2_config,
             sam2_checkpoint=args.sam2_checkpoint,
             sam_device=args.sam_device,

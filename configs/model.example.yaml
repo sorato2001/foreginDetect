@@ -6,6 +6,9 @@ sam_tracking:
   enabled: true
   object_model_path: "weights/yolo11l.pt"
   track_model_path: "weights/best.pt"
+  track_mask_labels:
+    - rail
+    - track
   sam2_config: "sam2_hiera_l.yaml"
   sam2_checkpoint: "weights/sam2_hiera_large.pt"
   device: "cuda"

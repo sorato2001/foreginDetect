@@ -377,11 +377,18 @@ branch or shared externally, rotate it before deployment.
 # COMMAND
 
 ```bash
+  # video
   python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda 
 
   python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
 
   python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300 
 
-  python -m src.pipeline.analyze_event --input-type image --image examples/RAIL_INTRUED.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/image_sam_tracking --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda
- ```
+
+
+  # image
+
+  python -m src.pipeline.analyze_event --input-type image --image examples/RailFence1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/image_sam_tracking_rail --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt -sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda
+
+  python -m src.pipeline.analyze_event --input-type image --image examples/K88+300-1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/K88+300-1 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1  --sam2-enabled true --sam-imgsz 640 --sam-device cuda
+```

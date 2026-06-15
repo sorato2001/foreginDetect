@@ -32,6 +32,8 @@ from src.vlm.mock_provider import MockVLMProvider
 from src.vlm.qwen_provider import QwenProvider
 from src.visualization.pipeline_visualizer import save_image_visualization
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
 
 def _fake_image_tracks() -> dict[int, list[Detection]]:
     """Return deterministic single-image detections for offline demos."""
@@ -66,6 +68,33 @@ def _detect_image_with_sam_tracking(image_path: str, config: SAMTrackingConfig) 
     return adapter.analyze_image(image_path)
 
 
+def collect_image_paths(image_path: str | Path, recursive: bool = False, limit: int | None = None) -> list[Path]:
+    """Collect one image path or all supported images in a directory."""
+    root = Path(image_path)
+    if root.is_file():
+        return [root] if root.suffix.lower() in IMAGE_SUFFIXES else []
+    if not root.is_dir():
+        return []
+    candidates = root.rglob("*") if recursive else root.iterdir()
+    paths = sorted(path for path in candidates if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+    if limit is not None and limit > 0:
+        return paths[:limit]
+    return paths
+
+
+def _batch_item_dir(output_dir: Path, source_root: Path, image_path: Path) -> Path:
+    """Return a stable per-image output directory."""
+    if source_root.is_dir():
+        try:
+            relative = image_path.relative_to(source_root).with_suffix("")
+        except ValueError:
+            relative = Path(image_path.stem)
+    else:
+        relative = Path(image_path.stem)
+    safe_parts = [part.replace(" ", "_") for part in relative.parts]
+    return output_dir.joinpath(*safe_parts)
+
+
 def run_image_pipeline(
     image_path: str,
     camera_id: str,
@@ -82,6 +111,7 @@ def run_image_pipeline(
     tracker: str = "simple_iou",
     sam_object_model: str | None = None,
     sam_track_model: str | None = None,
+    sam_track_labels: list[str] | None = None,
     sam_device: str = "cuda",
     sam_iou_threshold: float = 0.10,
     sam_object_overlap_threshold: float = 0.15,
@@ -115,6 +145,7 @@ def run_image_pipeline(
         sam_config = SAMTrackingConfig(
             object_model_path=sam_object_model or SAMTrackingConfig().object_model_path,
             track_model_path=sam_track_model or SAMTrackingConfig().track_model_path,
+            track_mask_labels=sam_track_labels or [],
             device=sam_device,
             iou_threshold=sam_iou_threshold,
             object_overlap_threshold=sam_object_overlap_threshold,
@@ -301,3 +332,83 @@ def run_image_pipeline(
         "final_level": alarm.final_level,
         "is_alarm": alarm.is_alarm,
     }
+
+
+def run_image_batch_pipeline(
+    image_path: str,
+    camera_id: str,
+    rules_path: str,
+    output_dir: str,
+    vlm_provider: str = "mock",
+    mock_detections: bool = False,
+    vlm_timeout: float = 20.0,
+    vlm_max_retries: int = 0,
+    vlm_fallback_on_error: bool = True,
+    save_visualization: bool = True,
+    log_level: str = "INFO",
+    tracker: str = "simple_iou",
+    sam_object_model: str | None = None,
+    sam_track_model: str | None = None,
+    sam_track_labels: list[str] | None = None,
+    sam_device: str = "cuda",
+    sam_iou_threshold: float = 0.10,
+    sam_object_overlap_threshold: float = 0.15,
+    sam_imgsz: int = 640,
+    recursive: bool = False,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Run image analysis for a file or directory and write a batch summary."""
+    source = Path(image_path)
+    out = ensure_output_dir(output_dir)
+    image_paths = collect_image_paths(source, recursive=recursive, limit=limit)
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+
+    for index, item in enumerate(image_paths, start=1):
+        item_output = _batch_item_dir(out, source, item)
+        event_id = f"image_{item.stem}_{index:04d}"
+        try:
+            result = run_image_pipeline(
+                image_path=str(item),
+                camera_id=camera_id,
+                rules_path=rules_path,
+                output_dir=str(item_output),
+                vlm_provider=vlm_provider,
+                event_id=event_id,
+                mock_detections=mock_detections,
+                vlm_timeout=vlm_timeout,
+                vlm_max_retries=vlm_max_retries,
+                vlm_fallback_on_error=vlm_fallback_on_error,
+                save_visualization=save_visualization,
+                log_level=log_level,
+                tracker=tracker,
+                sam_object_model=sam_object_model,
+                sam_track_model=sam_track_model,
+                sam_track_labels=sam_track_labels,
+                sam_device=sam_device,
+                sam_iou_threshold=sam_iou_threshold,
+                sam_object_overlap_threshold=sam_object_overlap_threshold,
+                sam_imgsz=sam_imgsz,
+            )
+            result["source_image"] = str(item)
+            results.append(result)
+        except Exception as exc:
+            logger.exception("Batch image analysis failed: image=%s", item)
+            failures.append({"image": str(item), "error_type": type(exc).__name__, "error_message": str(exc)[:500]})
+
+    summary = {
+        "input_type": "image_batch",
+        "source": str(source),
+        "output_dir": str(out),
+        "recursive": recursive,
+        "total": len(image_paths),
+        "succeeded": len(results),
+        "failed": len(failures),
+        "alarm_count": sum(1 for item in results if item.get("is_alarm")),
+        "results": results,
+        "failures": failures,
+    }
+    summary_path = out / "batch_summary.json"
+    save_json(summary, str(summary_path))
+    summary["summary_json"] = str(summary_path)
+    return summary

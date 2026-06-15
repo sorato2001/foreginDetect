@@ -76,6 +76,7 @@ class SAMTrackingConfig:
     device: str = "cuda"
     conf_threshold: float = 0.35
     target_labels: list[str] = field(default_factory=lambda: ["person", "cow", "sheep"])
+    track_mask_labels: list[str] = field(default_factory=list)
     iou_threshold: float = 0.10
     object_overlap_threshold: float = 0.15
     window_size: int = 5
@@ -545,19 +546,36 @@ class SAMTrackingAdapter:
             logger.info("SAMTracking track-mask predict done: elapsed=%.3fs", time.perf_counter() - start)
             merged = np.zeros(frame.shape[:2], dtype=np.uint8)
             has_any = False
+            allowed_labels = {str(item) for item in self.config.track_mask_labels}
             for result in results or []:
+                names = getattr(result, "names", None) or getattr(self._track_model, "names", {}) or {}
                 if getattr(result, "masks", None) is not None and result.masks is not None:
                     masks = result.masks.data
-                    for mask_tensor in masks:
+                    classes = []
+                    if getattr(result, "boxes", None) is not None and result.boxes is not None and getattr(result.boxes, "cls", None) is not None:
+                        classes = [int(item) for item in result.boxes.cls.detach().cpu().numpy().tolist()]
+                    for mask_index, mask_tensor in enumerate(masks):
+                        cls_id = classes[mask_index] if mask_index < len(classes) else None
+                        label = str(names.get(cls_id, cls_id)) if cls_id is not None else ""
+                        if not _class_allowed(label, cls_id, allowed_labels):
+                            continue
                         mask = mask_tensor.detach().cpu().numpy().astype("float32")
                         mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-                        merged = np.maximum(merged, (mask >= 0.5).astype(np.uint8))
+                        binary_mask = (mask >= 0.5).astype(np.uint8)
+                        if binary_mask.sum() == 0:
+                            continue
+                        merged = np.maximum(merged, binary_mask)
                         has_any = True
                 elif getattr(result, "boxes", None) is not None and result.boxes is not None:
                     boxes = result.boxes.xyxy.detach().cpu().numpy()
                     confs = result.boxes.conf.detach().cpu().numpy()
-                    for bbox, conf in zip(boxes, confs):
+                    classes = result.boxes.cls.detach().cpu().numpy() if getattr(result.boxes, "cls", None) is not None else [None] * len(boxes)
+                    for bbox, conf, cls_id in zip(boxes, confs, classes):
                         if float(conf) < self.config.conf_threshold:
+                            continue
+                        class_id = int(cls_id) if cls_id is not None else None
+                        label = str(names.get(class_id, class_id)) if class_id is not None else ""
+                        if not _class_allowed(label, class_id, allowed_labels):
                             continue
                         x1, y1, x2, y2 = [int(v) for v in bbox]
                         x1, y1 = max(0, x1), max(0, y1)
@@ -735,6 +753,7 @@ class SAMTrackingAdapter:
             "requested_device": self.config.device,
             "runtime_device": self._runtime_device,
             "target_labels": self.config.target_labels,
+            "track_mask_labels": self.config.track_mask_labels,
             "iou_threshold": self.config.iou_threshold,
             "object_overlap_threshold": self.config.object_overlap_threshold,
             "window_size": self.config.window_size,
@@ -1046,6 +1065,16 @@ def _is_real_sam2_config(path: Path) -> bool:
     except Exception:
         return False
     return "model:" in text and "_target_" in text
+
+
+def _class_allowed(label: str, class_id: int | None, allowed_labels: set[str]) -> bool:
+    """Match a YOLO class by either label name or numeric id."""
+    if not allowed_labels:
+        return True
+    candidates = {str(label)}
+    if class_id is not None:
+        candidates.add(str(class_id))
+    return bool(candidates & allowed_labels)
 
 
 def _detection_to_dict(det: Detection) -> dict[str, Any]:
