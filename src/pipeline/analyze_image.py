@@ -23,13 +23,13 @@ from src.perception.yolo_detector import YoloDetector
 from src.pipeline.analyze_event import (
     _configure_pipeline_logging,
     _pipeline_fallback_review,
+    _resolve_vlm_provider,
     _sam_tracking_mask_iou_rule,
     _sam_tracking_prompt_summary,
     logger,
 )
 from src.rules.rule_engine import RuleEngine
-from src.vlm.mock_provider import MockVLMProvider
-from src.vlm.qwen_provider import QwenProvider
+from src.vlm.provider_factory import build_vlm_provider
 from src.visualization.pipeline_visualizer import save_image_visualization
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -101,6 +101,10 @@ def run_image_pipeline(
     rules_path: str,
     output_dir: str,
     vlm_provider: str = "mock",
+    vlm_mode: str = "web",
+    vlm_local_endpoint: str = "http://localhost:8082/v1/chat/completions",
+    vlm_local_model: str = "gemma-4-26B",
+    vlm_local_max_images: int = 1,
     event_id: str | None = None,
     mock_detections: bool = False,
     vlm_timeout: float = 20.0,
@@ -122,13 +126,15 @@ def run_image_pipeline(
     out = ensure_output_dir(output_dir)
     log_path = _configure_pipeline_logging(out, log_level=log_level)
     pipeline_start = time.perf_counter()
+    effective_vlm_provider = _resolve_vlm_provider(vlm_provider, vlm_mode)
     logger.info(
-        "STEP 01 start: event_id=%s camera_id=%s image=%s output=%s vlm_provider=%s",
+        "STEP 01 start: event_id=%s camera_id=%s image=%s output=%s vlm_provider=%s vlm_mode=%s",
         event_id,
         camera_id,
         image_path,
         out,
-        vlm_provider,
+        effective_vlm_provider,
+        vlm_mode,
     )
     logger.info(
         "STEP 01 config: rules=%s tracker=%s mock_detections=%s save_visualization=%s",
@@ -256,34 +262,36 @@ def run_image_pipeline(
         logger.info("STEP 06 visualization: skipped")
 
     step_start = time.perf_counter()
-    logger.info("STEP 07 VLM: begin provider=%s timeout=%.1fs max_retries=%s", vlm_provider, vlm_timeout, vlm_max_retries)
-    provider = (
-        QwenProvider(
-            timeout_sec=vlm_timeout,
-            read_timeout_seconds=vlm_timeout,
-            max_retries=vlm_max_retries,
-            fallback_on_error=vlm_fallback_on_error,
-            artifact_dir=str(out),
-        )
-        if vlm_provider == "qwen"
-        else MockVLMProvider()
+    logger.info("STEP 07 VLM: begin provider=%s mode=%s timeout=%.1fs max_retries=%s", effective_vlm_provider, vlm_mode, vlm_timeout, vlm_max_retries)
+    provider = build_vlm_provider(
+        vlm_provider=effective_vlm_provider,
+        vlm_mode=vlm_mode,
+        timeout_sec=vlm_timeout,
+        max_retries=vlm_max_retries,
+        fallback_on_error=vlm_fallback_on_error,
+        artifact_dir=str(out),
+        local_endpoint=vlm_local_endpoint,
+        local_model=vlm_local_model,
+        local_max_images=vlm_local_max_images,
     )
     try:
         review = provider.review(evidence)
     except Exception as exc:
         logger.exception("STEP 07 VLM: provider raised unexpectedly, using image pipeline fallback")
-        review = _pipeline_fallback_review(exc, provider_name=vlm_provider)
-        if vlm_provider == "qwen":
+        provider_name = "local_gemma" if vlm_mode == "local" and effective_vlm_provider != "mock" else effective_vlm_provider
+        review = _pipeline_fallback_review(exc, provider_name=provider_name)
+        if effective_vlm_provider == "qwen" or vlm_mode == "local":
+            error_filename = "gemma_error.json" if provider_name == "local_gemma" else "qwen_error.json"
             save_json(
                 {
-                    "provider": "qwen",
+                    "provider": provider_name,
                     "success": False,
                     "error_type": type(exc).__name__,
                     "error_message": str(exc)[:500],
                     "fallback": True,
                     "pipeline_fallback": True,
                 },
-                str(out / "qwen_error.json"),
+                str(out / error_filename),
             )
     logger.info(
         "STEP 07 VLM: done level=%s confidence=%.3f success=%s fallback=%s elapsed=%.3fs",
@@ -340,6 +348,10 @@ def run_image_batch_pipeline(
     rules_path: str,
     output_dir: str,
     vlm_provider: str = "mock",
+    vlm_mode: str = "web",
+    vlm_local_endpoint: str = "http://localhost:8082/v1/chat/completions",
+    vlm_local_model: str = "gemma-4-26B",
+    vlm_local_max_images: int = 1,
     mock_detections: bool = False,
     vlm_timeout: float = 20.0,
     vlm_max_retries: int = 0,
@@ -374,6 +386,10 @@ def run_image_batch_pipeline(
                 rules_path=rules_path,
                 output_dir=str(item_output),
                 vlm_provider=vlm_provider,
+                vlm_mode=vlm_mode,
+                vlm_local_endpoint=vlm_local_endpoint,
+                vlm_local_model=vlm_local_model,
+                vlm_local_max_images=vlm_local_max_images,
                 event_id=event_id,
                 mock_detections=mock_detections,
                 vlm_timeout=vlm_timeout,

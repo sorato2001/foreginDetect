@@ -69,3 +69,40 @@ def test_alarm_engine_image_qwen_high_without_tracks_is_medium():
     alarm = AlarmEngine().fuse(evidence, review)
     assert alarm.final_level == "medium"
     assert alarm.is_alarm is True
+
+
+def test_alarm_engine_marks_sam_vlm_conflict_for_review():
+    evidence = EventEvidence(
+        event_id="sam_conflict",
+        camera_id="cam01",
+        video_path="alarm.jpg",
+        time_range=[0, 1],
+        metadata={"input_type": "image", "rule_source": "sam_tracking_mask_iou"},
+    )
+    review = VLMReview(
+        is_anomaly=True,
+        event_type="restricted_area_intrusion",
+        alarm_level_suggestion="medium",
+        confidence=0.7,
+        evidence_time=[[0, 1]],
+        evidence_tracks=[1],
+        matched_rules=[],
+        reason="visual review sees a possible railway intrusion",
+        possible_false_alarm=False,
+        recommended_action="check",
+        metadata={
+            "provider": "local_gemma",
+            "success": True,
+            "fallback": False,
+            "conflict_with_sam": True,
+            "needs_review": True,
+            "conflict_reason": "VLM reported anomaly but SAMTracking rule did not trigger.",
+        },
+    )
+
+    alarm = AlarmEngine().fuse(evidence, review)
+
+    assert alarm.final_level == "medium"
+    assert alarm.is_alarm is True
+    assert alarm.needs_review is True
+    assert alarm.conflict_with_sam is True

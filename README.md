@@ -15,7 +15,7 @@ event video
   -> ROI/rule engine
   -> keyframes + temporal windows
   -> event_evidence.json
-  -> mock or Qwen/DashScope VLM review
+  -> mock, local Gemma, or Qwen/DashScope VLM review
   -> alarm_result.json
 ```
 
@@ -231,6 +231,106 @@ python -m src.pipeline.analyze_event \
 ```
 
 If no key is configured, use `--vlm-provider mock`.
+
+## Local Gemma VLM
+
+The CLI now supports two VLM access modes:
+
+- `--vlm-mode web`: use Qwen/DashScope through the existing web API path.
+- `--vlm-mode local`: use a LAN/local Gemma VLM exposed as an OpenAI-compatible `/v1/chat/completions` endpoint.
+
+`--vlm_mode` is also accepted for compatibility with underscore-style CLI usage.
+
+`--vlm-provider` selects the concrete reviewer:
+
+- `auto`: choose `qwen` for `web`, choose `gemma` for `local`.
+- `qwen`: valid only with `--vlm-mode web`.
+- `gemma` / `local_gemma`: valid only with `--vlm-mode local`.
+- `mock`: offline mock review; it ignores web/local access.
+
+Conflicting combinations such as `--vlm-provider qwen --vlm-mode local` now fail
+fast instead of silently switching provider.
+
+Local Gemma default settings:
+
+```text
+endpoint: http://localhost:8082/v1/chat/completions
+model: gemma-4-26B
+authorization: Bearer sk-no-key-required
+```
+
+Example:
+
+```bash
+python -m src.pipeline.analyze_event \
+  --input-type image \
+  --image examples/RailFence3.png \
+  --camera-id cam02 \
+  --rules configs/rules.image.yaml \
+  --output outputs/gemma_local \
+  --vlm-provider gemma \
+  --vlm-mode local \
+  --vlm-local-endpoint http://localhost:8082/v1/chat/completions \
+  --vlm-local-model gemma-4-26B \
+  --vlm-timeout 600 \
+  --track sam_tracking \
+  --sam-object-model weights/yolo11l.pt \
+  --sam-track-model weights/FenceRail.pt \
+  --sam-track-labels 1 \
+  --sam-imgsz 640 \
+  --sam-device cuda
+```
+
+When `--vlm-provider` is omitted, the CLI uses `auto`: `web` resolves to Qwen and
+`local` resolves to Gemma. Explicit `--vlm-provider mock` still forces offline
+mock review.
+
+For video input, Local Gemma uses the same structured temporal prompt as Qwen:
+tracks, windows, ROI/rule triggers, and `metadata.sam_tracking.summary` from the
+SAM2 mask-IoU pipeline. This keeps the video decision path aligned with the Qwen
+API mode; only the VLM endpoint changes. For image input, the local path keeps a
+smaller evidence packet by default to avoid local context overflow. The default
+`--vlm-local-max-images` is `1` because small local context windows can be filled
+by image tokens; raise it only when your local server has enough context length.
+It writes:
+
+```text
+outputs/<event>/gemma_request_summary.json
+outputs/<event>/gemma_raw_response.json
+outputs/<event>/gemma_error.json   # only when the local request fails
+outputs/<event>/vlm_review.json
+```
+
+Video example using the same SAMTracking flow as the Qwen command:
+
+```bash
+python -m src.pipeline.analyze_event \
+  --input-type video \
+  --video examples/test1.mp4 \
+  --camera-id cam02 \
+  --rules configs/rules.image.yaml \
+  --output outputs/stead_sam2_local \
+  --vlm-provider gemma \
+  --vlm-mode local \
+  --vlm-local-endpoint http://localhost:8082/v1/chat/completions \
+  --vlm-local-model gemma-4-26B \
+  --vlm-timeout 600 \
+  --vlm-max-retries 2 \
+  --vlm-fallback-on-error true \
+  --track sam_tracking \
+  --sam-object-model weights/yolo11l.pt \
+  --sam-track-model weights/best.pt \
+  --sam2-enabled true \
+  --sam2-config sam2_hiera_l.yaml \
+  --sam2-checkpoint weights/sam2_hiera_large.pt \
+  --sam2-scan-frames 30 \
+  --sam-sample-every 15 \
+  --sam-track-mask-interval 30 \
+  --sam-imgsz 640 \
+  --sam-device cuda \
+  --max-analysis-frames 300 \
+  --visualization-max-frames 300
+```
 
 ## ROI Rules
 

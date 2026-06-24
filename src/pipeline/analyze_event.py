@@ -21,12 +21,30 @@ from src.perception.sam_tracking_adapter import SAMTrackingAdapter, SAMTrackingC
 from src.perception.simple_iou_tracker import SimpleIOUTracker
 from src.perception.yolo_detector import YoloDetector
 from src.rules.rule_engine import RuleEngine
-from src.vlm.mock_provider import MockVLMProvider
-from src.vlm.qwen_provider import QwenProvider
+from src.vlm.provider_factory import build_vlm_provider
 from src.vlm.vlm_schema import VLMReview
 from src.visualization.pipeline_visualizer import save_pipeline_visualization
 
 logger = logging.getLogger("stead.pipeline")
+
+
+def _resolve_vlm_provider(vlm_provider: str, vlm_mode: str) -> str:
+    """Resolve VLM provider and reject mode/provider combinations that conflict."""
+    provider = (vlm_provider or "auto").lower()
+    mode = (vlm_mode or "web").lower()
+    if provider == "auto":
+        return "qwen" if mode == "web" else "gemma"
+    if provider == "mock":
+        return "mock"
+    if provider == "qwen":
+        if mode != "web":
+            raise ValueError("--vlm-provider qwen requires --vlm-mode web")
+        return "qwen"
+    if provider in {"gemma", "local_gemma"}:
+        if mode != "local":
+            raise ValueError("--vlm-provider gemma requires --vlm-mode local")
+        return "gemma"
+    raise ValueError(f"Unsupported --vlm-provider: {vlm_provider}")
 
 
 def _parse_bool(value: str | bool) -> bool:
@@ -138,6 +156,10 @@ def run_pipeline(
     rules_path: str,
     output_dir: str,
     vlm_provider: str = "mock",
+    vlm_mode: str = "web",
+    vlm_local_endpoint: str = "http://localhost:8082/v1/chat/completions",
+    vlm_local_model: str = "gemma-4-26B",
+    vlm_local_max_images: int = 1,
     event_id: str | None = None,
     mock_detections: bool = False,
     vlm_timeout: float = 20.0,
@@ -172,13 +194,15 @@ def run_pipeline(
     out = ensure_output_dir(output_dir)
     log_path = _configure_pipeline_logging(out, log_level=log_level)
     pipeline_start = time.perf_counter()
+    effective_vlm_provider = _resolve_vlm_provider(vlm_provider, vlm_mode)
     logger.info(
-        "STEP 01 start: event_id=%s camera_id=%s video=%s output=%s vlm_provider=%s",
+        "STEP 01 start: event_id=%s camera_id=%s video=%s output=%s vlm_provider=%s vlm_mode=%s",
         event_id,
         camera_id,
         video_path,
         out,
-        vlm_provider,
+        effective_vlm_provider,
+        vlm_mode,
     )
     logger.info(
         "STEP 01 config: rules=%s tracker=%s mock_detections=%s max_analysis_frames=%s save_visualization=%s visualization_max_frames=%s",
@@ -316,39 +340,43 @@ def run_pipeline(
 
     step_start = time.perf_counter()
     logger.info(
-        "STEP 07 VLM: begin provider=%s timeout=%.1fs max_retries=%s fallback_on_error=%s",
-        vlm_provider,
+        "STEP 07 VLM: begin provider=%s mode=%s timeout=%.1fs max_retries=%s fallback_on_error=%s",
+        effective_vlm_provider,
+        vlm_mode,
         vlm_timeout,
         vlm_max_retries,
         vlm_fallback_on_error,
     )
-    provider = (
-        QwenProvider(
-            timeout_sec=vlm_timeout,
-            read_timeout_seconds=vlm_timeout,
-            max_retries=vlm_max_retries,
-            fallback_on_error=vlm_fallback_on_error,
-            artifact_dir=str(out),
-        )
-        if vlm_provider == "qwen"
-        else MockVLMProvider()
+    provider = build_vlm_provider(
+        vlm_provider=effective_vlm_provider,
+        vlm_mode=vlm_mode,
+        timeout_sec=vlm_timeout,
+        max_retries=vlm_max_retries,
+        fallback_on_error=vlm_fallback_on_error,
+        artifact_dir=str(out),
+        local_endpoint=vlm_local_endpoint,
+        local_model=vlm_local_model,
+        local_max_images=vlm_local_max_images,
+        local_evidence_mode="qwen",
     )
     try:
         review = provider.review(evidence)
     except Exception as exc:
         logger.exception("STEP 07 VLM: provider raised unexpectedly, using pipeline fallback")
-        review = _pipeline_fallback_review(exc, provider_name=vlm_provider)
-        if vlm_provider == "qwen":
+        provider_name = "local_gemma" if vlm_mode == "local" and effective_vlm_provider != "mock" else effective_vlm_provider
+        review = _pipeline_fallback_review(exc, provider_name=provider_name)
+        if effective_vlm_provider == "qwen" or vlm_mode == "local":
+            error_filename = "gemma_error.json" if provider_name == "local_gemma" else "qwen_error.json"
             save_json(
                 {
-                    "provider": "qwen",
+                    "provider": provider_name,
                     "success": False,
                     "error_type": type(exc).__name__,
                     "error_message": str(exc)[:500],
                     "fallback": True,
                     "pipeline_fallback": True,
                 },
-                str(out / "qwen_error.json"),
+                str(out / error_filename),
             )
     logger.info(
         "STEP 07 VLM: done level=%s confidence=%.3f success=%s fallback=%s elapsed=%.3fs",
@@ -513,7 +541,11 @@ def main() -> int:
     parser.add_argument("--camera-id", required=True)
     parser.add_argument("--rules", default="configs/rules.example.yaml")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--vlm-provider", choices=["mock", "qwen"], default="mock")
+    parser.add_argument("--vlm-provider", choices=["auto", "mock", "qwen", "gemma", "local_gemma"], default="auto")
+    parser.add_argument("--vlm-mode", "--vlm_mode", dest="vlm_mode", choices=["local", "web"], default="web", help="local uses LAN Gemma VLM; web uses Qwen/DashScope")
+    parser.add_argument("--vlm-local-endpoint", default="http://localhost:8082/v1/chat/completions")
+    parser.add_argument("--vlm-local-model", default="gemma-4-26B")
+    parser.add_argument("--vlm-local-max-images", type=int, default=1)
     parser.add_argument("--event-id", default=None)
     parser.add_argument("--mock-detections", action="store_true")
     parser.add_argument("--vlm-timeout", type=float, default=20.0)
@@ -543,6 +575,10 @@ def main() -> int:
     parser.add_argument("--sam-imgsz", type=int, default=640, help="YOLO inference image size for SAMTracking")
     parser.add_argument("--sam-progress-interval", type=int, default=10, help="Log SAMTracking progress every N processed frames")
     args = parser.parse_args()
+    try:
+        _resolve_vlm_provider(args.vlm_provider, args.vlm_mode)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.input_type == "image":
         if not args.image:
             parser.error("--image is required when --input-type image")
@@ -556,6 +592,10 @@ def main() -> int:
                 rules_path=args.rules,
                 output_dir=args.output,
                 vlm_provider=args.vlm_provider,
+                vlm_mode=args.vlm_mode,
+                vlm_local_endpoint=args.vlm_local_endpoint,
+                vlm_local_model=args.vlm_local_model,
+                vlm_local_max_images=args.vlm_local_max_images,
                 mock_detections=args.mock_detections,
                 vlm_timeout=args.vlm_timeout,
                 vlm_max_retries=args.vlm_max_retries,
@@ -582,6 +622,10 @@ def main() -> int:
                 rules_path=args.rules,
                 output_dir=args.output,
                 vlm_provider=args.vlm_provider,
+                vlm_mode=args.vlm_mode,
+                vlm_local_endpoint=args.vlm_local_endpoint,
+                vlm_local_model=args.vlm_local_model,
+                vlm_local_max_images=args.vlm_local_max_images,
                 event_id=args.event_id,
                 mock_detections=args.mock_detections,
                 vlm_timeout=args.vlm_timeout,
@@ -607,6 +651,10 @@ def main() -> int:
             rules_path=args.rules,
             output_dir=args.output,
             vlm_provider=args.vlm_provider,
+            vlm_mode=args.vlm_mode,
+            vlm_local_endpoint=args.vlm_local_endpoint,
+            vlm_local_model=args.vlm_local_model,
+            vlm_local_max_images=args.vlm_local_max_images,
             event_id=args.event_id,
             mock_detections=args.mock_detections,
             vlm_timeout=args.vlm_timeout,

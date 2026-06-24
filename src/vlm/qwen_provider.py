@@ -19,7 +19,7 @@ from pydantic import ValidationError
 from src.evidence.evidence_schema import EventEvidence
 from src.evidence.serializers import save_json
 from src.vlm.json_validator import parse_vlm_review
-from src.vlm.prompts import build_review_prompt
+from src.vlm.prompts import build_review_prompt, summarize_evidence
 from src.vlm.review_provider import VLMReviewProvider
 from src.vlm.vlm_schema import VLMReview
 
@@ -71,6 +71,7 @@ class QwenProvider(VLMReviewProvider):
         if not api_key:
             return self._fallback_review(evidence, "MissingAPIKey", f"{self.api_key_env} is not configured", retry_count=0)
 
+        vlm_input = self._vlm_input_metadata(evidence)
         payload = self._payload(evidence)
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -102,6 +103,7 @@ class QwenProvider(VLMReviewProvider):
                 if review is None:
                     raise ValueError(error["message"] if error else "invalid Qwen JSON")
                 review.metadata.update(self._base_metadata(success=True, retry_count=attempt, fallback=False))
+                review.metadata["vlm_input"] = vlm_input
                 logger.info(
                     "Qwen review attempt %s/%s: success level=%s confidence=%.3f normalized=%s",
                     attempt + 1,
@@ -128,10 +130,14 @@ class QwenProvider(VLMReviewProvider):
                     time.sleep(self.retry_backoff_seconds * (attempt + 1))
                     continue
                 self._write_error(exc, retry_count=attempt)
-                return self._fallback_review(evidence, type(exc).__name__, str(exc), retry_count=attempt)
+                fallback = self._fallback_review(evidence, type(exc).__name__, str(exc), retry_count=attempt)
+                fallback.metadata["vlm_input"] = vlm_input
+                return fallback
 
         assert last_exc is not None
-        return self._fallback_review(evidence, type(last_exc).__name__, str(last_exc), retry_count=self.max_retries)
+        fallback = self._fallback_review(evidence, type(last_exc).__name__, str(last_exc), retry_count=self.max_retries)
+        fallback.metadata["vlm_input"] = vlm_input
+        return fallback
 
     def _payload(self, evidence: EventEvidence) -> dict[str, Any]:
         """Build DashScope compatible chat payload."""
@@ -153,16 +159,38 @@ class QwenProvider(VLMReviewProvider):
             "temperature": 0.0,
         }
 
+    def _vlm_input_metadata(self, evidence: EventEvidence) -> dict[str, Any]:
+        """Return the non-secret evidence packet sent to Qwen."""
+        prompt_text = build_review_prompt(evidence)
+        image_path = self._first_keyframe_path(evidence)
+        return {
+            "provider": "qwen",
+            "evidence_mode": "qwen",
+            "image_count": 1 if image_path else 0,
+            "image_paths": [image_path] if image_path else [],
+            "prompt_text": prompt_text,
+            "prompt_text_chars": len(prompt_text),
+            "evidence_summary": summarize_evidence(evidence),
+        }
+
     @staticmethod
     def _first_keyframe_data_url(evidence: EventEvidence) -> str | None:
         """Return the first local keyframe encoded as a data URL."""
-        for keyframe in evidence.keyframes:
-            path = Path(keyframe.frame_path)
-            if not path.exists() or not path.is_file():
-                continue
+        image_path = QwenProvider._first_keyframe_path(evidence)
+        if image_path:
+            path = Path(image_path)
             mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
             data = base64.b64encode(path.read_bytes()).decode("ascii")
             return f"data:{mime};base64,{data}"
+        return None
+
+    @staticmethod
+    def _first_keyframe_path(evidence: EventEvidence) -> str | None:
+        """Return the first existing local keyframe path."""
+        for keyframe in evidence.keyframes:
+            path = Path(keyframe.frame_path)
+            if path.exists() and path.is_file():
+                return keyframe.frame_path
         return None
 
     def _base_metadata(self, success: bool, retry_count: int, fallback: bool) -> dict[str, Any]:

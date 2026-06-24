@@ -23,4 +23,5 @@ class AlarmResult(BaseModel):
     vlm_score: float = Field(ge=0.0, le=1.0)
     uncertainty: float = Field(ge=0.0, le=1.0)
     action: str
-
+    needs_review: bool = False
+    conflict_with_sam: bool = False

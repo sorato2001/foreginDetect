@@ -31,6 +31,11 @@ class AlarmEngine:
                 final_level = self._max_level(final_level, "medium")
             elif review.alarm_level_suggestion == "medium" and review.confidence >= 0.65:
                 final_level = self._max_level(final_level, "medium")
+        conflict_with_sam = bool(review.metadata.get("conflict_with_sam"))
+        needs_review = conflict_with_sam or bool(review.metadata.get("needs_review"))
+        if conflict_with_sam:
+            final_level = self._max_level(final_level, "medium")
+            final_score = max(final_score, 0.50)
         is_alarm = final_level in {"medium", "high"}
         reasons = self._reasons(triggered, review, final_score)
         uncertainty = max(0.0, min(1.0, 1.0 - max(rule_score, vlm_score)))
@@ -46,6 +51,8 @@ class AlarmEngine:
             vlm_score=max(0.0, min(1.0, vlm_score)),
             uncertainty=uncertainty,
             action=self._action(final_level),
+            needs_review=needs_review,
+            conflict_with_sam=conflict_with_sam,
         )
 
     @staticmethod
@@ -103,6 +110,9 @@ class AlarmEngine:
                 reasons.append("No rule was triggered; Qwen failure does not mean Qwen judged the event normal.")
         if review.metadata.get("provider") == "qwen" and review.metadata.get("success") and review.is_anomaly:
             reasons.append("Qwen image/text review reported anomaly evidence.")
+        if review.metadata.get("conflict_with_sam"):
+            reasons.append(str(review.metadata.get("conflict_reason") or "VLM and SAMTracking decisions conflict."))
+            reasons.append("Safety policy: keep the event and require manual verification.")
         reasons.append(f"VLM: {review.reason}")
         reasons.append(f"Final fused score={final_score:.3f}.")
         return reasons

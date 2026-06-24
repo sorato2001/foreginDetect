@@ -17,4 +17,6 @@ def test_vlm_review_metadata(monkeypatch):
     assert review.metadata["fallback"] is True
     assert review.metadata["provider"] == "qwen"
     assert review.metadata["success"] is False
-
+    assert review.metadata["vlm_input"]["provider"] == "qwen"
+    assert review.metadata["vlm_input"]["evidence_mode"] == "qwen"
+    assert "event_evidence_summary" in review.metadata["vlm_input"]["prompt_text"]
