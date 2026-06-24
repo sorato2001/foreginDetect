@@ -487,8 +487,15 @@ branch or shared externally, rotate it before deployment.
 
 
   # image
-
   python -m src.pipeline.analyze_event --input-type image --image examples/RailFence1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/image_sam_tracking_rail --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt -sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda
 
   python -m src.pipeline.analyze_event --input-type image --image examples/K88+300-1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/K88+300-1 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1  --sam2-enabled true --sam-imgsz 640 --sam-device cuda
+
+  # Gemma
+
+  ## image
+  python -m src.pipeline.analyze_event --input-type image --image examples/RailFence4.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/gemma_local_2 --vlm_mode local  --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt  --sam-track-labels 1 --sam-imgsz 640 --sam-device cuda
+  ## video
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_local_2 --vlm-mode local --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300
+  
 ```
