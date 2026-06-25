@@ -21,30 +21,11 @@ from src.perception.sam_tracking_adapter import SAMTrackingAdapter, SAMTrackingC
 from src.perception.simple_iou_tracker import SimpleIOUTracker
 from src.perception.yolo_detector import YoloDetector
 from src.rules.rule_engine import RuleEngine
-from src.vlm.provider_factory import build_vlm_provider
-from src.vlm.vlm_schema import VLMReview
+from src.vlm.pipeline_runner import run_vlm_review
+from src.vlm.provider_factory import resolve_vlm_provider
 from src.visualization.pipeline_visualizer import save_pipeline_visualization
 
 logger = logging.getLogger("stead.pipeline")
-
-
-def _resolve_vlm_provider(vlm_provider: str, vlm_mode: str) -> str:
-    """Resolve VLM provider and reject mode/provider combinations that conflict."""
-    provider = (vlm_provider or "auto").lower()
-    mode = (vlm_mode or "web").lower()
-    if provider == "auto":
-        return "qwen" if mode == "web" else "gemma"
-    if provider == "mock":
-        return "mock"
-    if provider == "qwen":
-        if mode != "web":
-            raise ValueError("--vlm-provider qwen requires --vlm-mode web")
-        return "qwen"
-    if provider in {"gemma", "local_gemma"}:
-        if mode != "local":
-            raise ValueError("--vlm-provider gemma requires --vlm-mode local")
-        return "gemma"
-    raise ValueError(f"Unsupported --vlm-provider: {vlm_provider}")
 
 
 def _parse_bool(value: str | bool) -> bool:
@@ -184,6 +165,7 @@ def run_pipeline(
     sam2_enabled: bool = True,
     sam2_scan_frames: int = 30,
     sam2_prompt_mode: str = "bounding_box",
+    sam_temporal_mode: str = "fast",
     sam_sample_every: int = 15,
     sam_track_mask_interval: int = 30,
     sam_imgsz: int = 640,
@@ -194,7 +176,7 @@ def run_pipeline(
     out = ensure_output_dir(output_dir)
     log_path = _configure_pipeline_logging(out, log_level=log_level)
     pipeline_start = time.perf_counter()
-    effective_vlm_provider = _resolve_vlm_provider(vlm_provider, vlm_mode)
+    effective_vlm_provider = resolve_vlm_provider(vlm_provider, vlm_mode)
     logger.info(
         "STEP 01 start: event_id=%s camera_id=%s video=%s output=%s vlm_provider=%s vlm_mode=%s",
         event_id,
@@ -233,6 +215,7 @@ def run_pipeline(
             sam2_enabled=sam2_enabled,
             sam2_scan_frames=sam2_scan_frames,
             sam2_prompt_mode=sam2_prompt_mode,
+            temporal_mode=sam_temporal_mode,
             sample_every=sam_sample_every,
             track_mask_interval=sam_track_mask_interval,
             imgsz=sam_imgsz,
@@ -347,37 +330,19 @@ def run_pipeline(
         vlm_max_retries,
         vlm_fallback_on_error,
     )
-    provider = build_vlm_provider(
+    review, effective_vlm_provider = run_vlm_review(
+        evidence=evidence,
+        output_dir=out,
         vlm_provider=effective_vlm_provider,
         vlm_mode=vlm_mode,
         timeout_sec=vlm_timeout,
         max_retries=vlm_max_retries,
         fallback_on_error=vlm_fallback_on_error,
-        artifact_dir=str(out),
         local_endpoint=vlm_local_endpoint,
         local_model=vlm_local_model,
         local_max_images=vlm_local_max_images,
         local_evidence_mode="qwen",
     )
-    try:
-        review = provider.review(evidence)
-    except Exception as exc:
-        logger.exception("STEP 07 VLM: provider raised unexpectedly, using pipeline fallback")
-        provider_name = "local_gemma" if vlm_mode == "local" and effective_vlm_provider != "mock" else effective_vlm_provider
-        review = _pipeline_fallback_review(exc, provider_name=provider_name)
-        if effective_vlm_provider == "qwen" or vlm_mode == "local":
-            error_filename = "gemma_error.json" if provider_name == "local_gemma" else "qwen_error.json"
-            save_json(
-                {
-                    "provider": provider_name,
-                    "success": False,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc)[:500],
-                    "fallback": True,
-                    "pipeline_fallback": True,
-                },
-                str(out / error_filename),
-            )
     logger.info(
         "STEP 07 VLM: done level=%s confidence=%.3f success=%s fallback=%s elapsed=%.3fs",
         review.alarm_level_suggestion,
@@ -428,7 +393,7 @@ def run_pipeline(
 
 def _sam_tracking_mask_iou_rule(sam_tracking_result: SAMTrackingResult | None) -> ROIRuleTrigger | None:
     """Build a STEP 04 rule result from SAMTracking mask-IoU intrusion judgment."""
-    if sam_tracking_result is None or not sam_tracking_result.metadata.get("track_mask_seen"):
+    if sam_tracking_result is None or not _sam_tracking_has_track_mask(sam_tracking_result):
         return None
     alarm_frames = [frame for frame in sam_tracking_result.frames if frame.alarm]
     suspicious_frames = [frame for frame in sam_tracking_result.frames if frame.suspicious]
@@ -455,6 +420,13 @@ def _sam_tracking_mask_iou_rule(sam_tracking_result: SAMTrackingResult | None) -
         evidence_tracks=evidence_tracks,
         severity_hint=severity,
     )
+
+
+def _sam_tracking_has_track_mask(sam_tracking_result: SAMTrackingResult) -> bool:
+    """Return true only when SAMTracking produced an actual railway/track mask."""
+    if not sam_tracking_result.metadata.get("track_mask_seen"):
+        return False
+    return any(frame.track_mask_available for frame in sam_tracking_result.frames)
 
 
 def _sam_tracking_prompt_summary(sam_tracking_result: SAMTrackingResult) -> dict:
@@ -505,31 +477,6 @@ def _sam_tracking_prompt_summary(sam_tracking_result: SAMTrackingResult) -> dict
     }
 
 
-def _pipeline_fallback_review(exc: Exception, provider_name: str) -> VLMReview:
-    """Last-resort fallback if a provider unexpectedly raises."""
-    error_type = type(exc).__name__
-    return VLMReview(
-        is_anomaly=False,
-        event_type="none",
-        alarm_level_suggestion="none",
-        confidence=0.0,
-        evidence_time=[],
-        evidence_tracks=[],
-        matched_rules=[],
-        reason=f"{provider_name} review failed in pipeline: {error_type}. Fallback review generated.",
-        possible_false_alarm=True,
-        recommended_action="manual review recommended",
-        metadata={
-            "provider": provider_name,
-            "success": False,
-            "error_type": error_type,
-            "error_message": str(exc)[:500],
-            "fallback": True,
-            "pipeline_fallback": True,
-        },
-    )
-
-
 def main() -> int:
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Analyze one surveillance event with STEAD.")
@@ -570,13 +517,14 @@ def main() -> int:
     parser.add_argument("--sam2-enabled", default="true")
     parser.add_argument("--sam2-scan-frames", type=int, default=30)
     parser.add_argument("--sam2-prompt-mode", default="bounding_box", choices=["bounding_box", "center_point", "centroid"])
+    parser.add_argument("--sam-temporal-mode", choices=["fast", "faithful", "reference"], default="fast", help="SAMTracking video timing: faithful/reference runs YOLO and railway mask every frame; fast caches them while SAM2 still advances every frame")
     parser.add_argument("--sam-sample-every", type=int, default=15, help="Run object detection every N frames in SAMTracking")
     parser.add_argument("--sam-track-mask-interval", type=int, default=30, help="Run railway mask segmentation every N frames in SAMTracking")
     parser.add_argument("--sam-imgsz", type=int, default=640, help="YOLO inference image size for SAMTracking")
     parser.add_argument("--sam-progress-interval", type=int, default=10, help="Log SAMTracking progress every N processed frames")
     args = parser.parse_args()
     try:
-        _resolve_vlm_provider(args.vlm_provider, args.vlm_mode)
+        resolve_vlm_provider(args.vlm_provider, args.vlm_mode)
     except ValueError as exc:
         parser.error(str(exc))
     if args.input_type == "image":
@@ -679,6 +627,7 @@ def main() -> int:
             sam2_enabled=_parse_bool(args.sam2_enabled),
             sam2_scan_frames=args.sam2_scan_frames,
             sam2_prompt_mode=args.sam2_prompt_mode,
+            sam_temporal_mode=args.sam_temporal_mode,
             sam_sample_every=args.sam_sample_every,
             sam_track_mask_interval=args.sam_track_mask_interval,
             sam_imgsz=args.sam_imgsz,

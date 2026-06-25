@@ -87,6 +87,7 @@ class SAMTrackingConfig:
     sam2_scan_frames: int = 30
     sam2_prompt_mode: str = "bounding_box"
     sam2_new_object_iou_threshold: float = 0.3
+    temporal_mode: str = "fast"
     sample_every: int = 15
     track_mask_interval: int = 30
     imgsz: int = 640
@@ -284,8 +285,14 @@ class SAMTrackingAdapter:
 
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        sample_every = max(1, int(self.config.sample_every))
-        track_mask_interval = int(self.config.track_mask_interval)
+        temporal_mode = (self.config.temporal_mode or "fast").strip().lower()
+        if temporal_mode not in {"fast", "faithful", "reference"}:
+            logger.warning("Unknown SAMTracking temporal_mode=%s, using fast", self.config.temporal_mode)
+            temporal_mode = "fast"
+        if temporal_mode == "reference":
+            temporal_mode = "faithful"
+        sample_every = 1 if temporal_mode == "faithful" else max(1, int(self.config.sample_every))
+        track_mask_interval = 1 if temporal_mode == "faithful" else int(self.config.track_mask_interval)
         track_mask_enabled = track_mask_interval > 0
         if track_mask_enabled:
             track_mask_interval = max(1, track_mask_interval)
@@ -305,11 +312,12 @@ class SAMTrackingAdapter:
         if self.config.sam2_enabled:
             self._initialize_sam2_video(video_path, fps, max_frames)
         logger.info(
-            "SAMTracking analyze start: video=%s fps=%.3f total_frames=%s max_frames=%s sample_every=%s track_mask_interval=%s track_mask_enabled=%s device=%s imgsz=%s",
+            "SAMTracking analyze start: video=%s fps=%.3f total_frames=%s max_frames=%s temporal_mode=%s sample_every=%s track_mask_interval=%s track_mask_enabled=%s device=%s imgsz=%s",
             video_path,
             fps,
             total_frames,
             max_frames,
+            temporal_mode,
             sample_every,
             track_mask_interval,
             track_mask_enabled,
@@ -323,23 +331,29 @@ class SAMTrackingAdapter:
             ok, frame = cap.read()
             if not ok:
                 break
-            if frame_index % sample_every != 0:
-                frame_index += 1
-                continue
 
             timestamp = frame_index / fps if fps > 0 else 0.0
-            detections = self.detect_objects(frame, frame_index, timestamp)
+            should_detect_objects = temporal_mode == "faithful" or frame_index % sample_every == 0
+            detections = self.detect_objects(frame, frame_index, timestamp) if should_detect_objects else []
             detection_seen = detection_seen or bool(detections)
-            tracks = tracker.update(detections)
+            if detections:
+                tracks = tracker.update(detections)
+            else:
+                tracks = tracker.tracks
             if track_mask_enabled and (cached_track_mask is None or frame_index % track_mask_interval == 0):
                 cached_track_mask = self.detect_track_mask(frame)
             track_mask = cached_track_mask
             track_mask_seen = track_mask_seen or bool(track_mask is not None and np.asarray(track_mask).sum() > 0)
             object_ids = [det_to_track_id(det, tracks) for det in detections]
-            object_masks = self.segment_objects(frame, detections, frame_index=frame_index, object_ids=object_ids)
+            object_masks, mask_object_ids = self._segment_objects_with_ids(
+                frame,
+                detections,
+                frame_index=frame_index,
+                object_ids=object_ids,
+            )
             if self.config.use_optical_flow and object_masks:
                 object_masks = [
-                    self._smooth_object_mask(frame, mask, object_ids[index] if index < len(object_ids) else index)
+                    self._smooth_object_mask(frame, mask, mask_object_ids[index] if index < len(mask_object_ids) else index)
                     for index, mask in enumerate(object_masks)
                 ]
             if track_mask is not None:
@@ -389,13 +403,14 @@ class SAMTrackingAdapter:
             {
                 "processed_frames": processed,
                 "total_frames": total_frames,
+                "temporal_mode": temporal_mode,
                 "sample_every": sample_every,
                 "track_mask_interval": track_mask_interval,
                 "track_mask_enabled": track_mask_enabled,
                 "track_mask_seen": track_mask_seen,
                 "detections_seen": detection_seen,
                 "fallback_to_bbox_mask": self.config.fallback_to_bbox_mask,
-                "sam2_mode": "placeholder_or_bbox_mask",
+                "sam2_mode": "streaming_memory" if self._sam2_tracker is not None else "bbox_mask",
             }
         )
         return SAMTrackingResult(
@@ -596,8 +611,26 @@ class SAMTrackingAdapter:
         object_ids: list[int | None] | None = None,
     ) -> list[Any]:
         """Return SAM2 object masks, falling back to bbox masks if needed."""
+        masks, _mask_ids = self._segment_objects_with_ids(frame, detections, frame_index=frame_index, object_ids=object_ids)
+        return masks
+
+    def _segment_objects_with_ids(
+        self,
+        frame: Any,
+        detections: list[Detection],
+        frame_index: int = 0,
+        object_ids: list[int | None] | None = None,
+    ) -> tuple[list[Any], list[int | None]]:
+        """Return object masks and stable mask ids for temporal smoothing."""
         if not detections:
-            return []
+            if self._sam2_tracker is not None:
+                try:
+                    masks, _scores, sam_object_ids = self._sam2_tracker.track_frame(frame_index, None)
+                    return masks, [int(item) for item in sam_object_ids]
+                except Exception as exc:
+                    self._sam2_error = f"sam2_track_failed: {type(exc).__name__}: {exc}"
+                    logger.warning("SAM2 tracking failed at frame=%s, fallback to empty masks: %s", frame_index, exc)
+            return [], []
         if self._sam2_tracker is not None:
             try:
                 masks, _scores, sam_object_ids = self._sam2_tracker.track_frame(
@@ -605,14 +638,14 @@ class SAMTrackingAdapter:
                     self._detections_to_prompts(detections),
                 )
                 if masks:
-                    return masks
+                    return masks, [int(item) for item in sam_object_ids]
                 logger.debug("SAM2 returned no masks at frame=%s ids=%s", frame_index, sam_object_ids)
             except Exception as exc:
                 self._sam2_error = f"sam2_track_failed: {type(exc).__name__}: {exc}"
                 logger.warning("SAM2 tracking failed at frame=%s, fallback to bbox masks: %s", frame_index, exc)
         if self.config.fallback_to_bbox_mask:
-            return [bbox_to_mask(frame.shape[:2], det.bbox) for det in detections]
-        return []
+            return [bbox_to_mask(frame.shape[:2], det.bbox) for det in detections], list(object_ids or [None] * len(detections))
+        return [], []
 
     def _load_models(self) -> None:
         """Lazy-load YOLO models and record missing SAM2 as degraded metadata."""
@@ -652,6 +685,7 @@ class SAMTrackingAdapter:
         if not self.config.sam2_config or not self.config.sam2_checkpoint:
             return "sam2_not_configured"
         try:
+            import decord  # noqa: F401
             from sam2.build_sam import build_sam2_video_predictor  # noqa: F401
         except Exception as exc:
             return f"sam2_unavailable: {exc}"
@@ -824,6 +858,10 @@ class _SAM2VideoMemoryTracker:
         self._predictor: Any | None = None
         self._inference_state: Any | None = None
         self._propagate_gen: Any | None = None
+        self._last_output_frame_idx = -1
+        self._last_masks: list[Any] = []
+        self._last_scores: list[float] = []
+        self._last_ids: list[int] = []
         self._object_counter = 0
         self._registered_boxes: list[Any] = []
         self._has_objects = False
@@ -838,9 +876,16 @@ class _SAM2VideoMemoryTracker:
         )
         self._object_counter = 0
         self._registered_boxes = []
+        self._last_output_frame_idx = -1
+        self._last_masks = []
+        self._last_scores = []
+        self._last_ids = []
         prompts = scan_prompts or []
         for frame_idx, prompt in enumerate(prompts[: self.scan_frames]):
-            for box in prompt.get("boxes", []) or []:
+            boxes = prompt.get("boxes")
+            if boxes is None:
+                continue
+            for box in boxes:
                 if any(_box_iou(box, registered) > self.new_obj_iou_thresh for registered in self._registered_boxes):
                     continue
                 obj_id = self._object_counter
@@ -856,20 +901,31 @@ class _SAM2VideoMemoryTracker:
         self._propagate_gen = predictor.propagate_in_video(self._inference_state) if self._has_objects else None
 
     def track_frame(self, frame_idx: int, yolo_prompts: dict[str, Any] | None = None) -> tuple[list[Any], list[float], list[int]]:
-        """Return SAM2 propagated masks for current frame."""
+        """Return SAM2 masks aligned to ``frame_idx`` by advancing the stream."""
         if self._inference_state is None:
             raise RuntimeError("SAM2 tracker not initialized")
         if self._propagate_gen is None:
             return [], [], []
-        try:
-            out_frame_idx, out_obj_ids, out_logits = next(self._propagate_gen)
-        except StopIteration:
-            return [], [], []
+        if frame_idx < self._last_output_frame_idx:
+            return self._last_masks, self._last_scores, self._last_ids
+        out_frame_idx = self._last_output_frame_idx
+        out_obj_ids: Any = self._last_ids
+        out_logits: Any | None = None
+        while out_frame_idx < frame_idx:
+            try:
+                out_frame_idx, out_obj_ids, out_logits = next(self._propagate_gen)
+            except StopIteration:
+                return self._last_masks, self._last_scores, self._last_ids
+        if out_logits is None:
+            return self._last_masks, self._last_scores, self._last_ids
         try:
             import numpy as np
-            import torch
+            try:
+                import torch
+            except Exception:
+                torch = None  # type: ignore[assignment]
 
-            if isinstance(out_logits, torch.Tensor):
+            if torch is not None and isinstance(out_logits, torch.Tensor):
                 masks_tensor = (torch.sigmoid(out_logits) > 0.5).squeeze(1).detach().cpu().numpy().astype(np.uint8)
             else:
                 masks_tensor = (np.asarray(out_logits) > 0.5).squeeze(1).astype(np.uint8)
@@ -877,7 +933,13 @@ class _SAM2VideoMemoryTracker:
                 masks_tensor = np.expand_dims(masks_tensor, 0)
             masks = [mask for mask in masks_tensor]
             ids = list(out_obj_ids) if hasattr(out_obj_ids, "__iter__") else [int(out_obj_ids)]
-            return masks, [1.0] * len(ids), [int(item) for item in ids]
+            self._last_output_frame_idx = int(out_frame_idx)
+            self._last_masks = masks
+            self._last_scores = [1.0] * len(ids)
+            self._last_ids = [int(item) for item in ids]
+            if self._last_output_frame_idx != frame_idx:
+                logger.debug("SAM2 output aligned to frame=%s for requested frame=%s", self._last_output_frame_idx, frame_idx)
+            return self._last_masks, self._last_scores, self._last_ids
         except Exception as exc:
             logger.warning("SAM2 output conversion failed at frame=%s: %s", frame_idx, exc)
             return [], [], []

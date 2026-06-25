@@ -68,7 +68,7 @@ class LocalGemmaProvider(VLMReviewProvider):
     def review(self, evidence: EventEvidence) -> VLMReview:
         """Call local Gemma VLM and return a validated review."""
         vlm_input = self._vlm_input_metadata(evidence)
-        payload = self._payload(evidence)
+        payload = self._payload(evidence, vlm_input=vlm_input)
         self._write_request_summary(payload)
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -133,12 +133,13 @@ class LocalGemmaProvider(VLMReviewProvider):
         self._annotate_sam_consistency(evidence, fallback)
         return fallback
 
-    def _payload(self, evidence: EventEvidence) -> dict[str, Any]:
+    def _payload(self, evidence: EventEvidence, vlm_input: dict[str, Any] | None = None) -> dict[str, Any]:
         """Build OpenAI-compatible multimodal payload with compact evidence."""
+        vlm_input = vlm_input or self._vlm_input_metadata(evidence)
         content: list[dict[str, Any]] = []
-        for image_url in self._keyframe_data_urls(evidence):
+        for image_url in self._image_paths_to_data_urls(vlm_input["image_paths"]):
             content.append({"type": "image_url", "image_url": {"url": image_url}})
-        content.append({"type": "text", "text": self._review_text(evidence)})
+        content.append({"type": "text", "text": vlm_input["prompt_text"]})
         return {
             "model": self.model,
             "messages": [
@@ -181,11 +182,12 @@ class LocalGemmaProvider(VLMReviewProvider):
     def _vlm_input_metadata(self, evidence: EventEvidence) -> dict[str, Any]:
         """Return the non-secret evidence packet sent to the local VLM."""
         prompt_text = self._review_text(evidence)
+        image_paths = self._sent_image_paths(evidence)
         return {
             "provider": "local_gemma",
             "evidence_mode": self.evidence_mode,
-            "image_count": len(self._sent_image_paths(evidence)),
-            "image_paths": self._sent_image_paths(evidence),
+            "image_count": len(image_paths),
+            "image_paths": image_paths,
             "prompt_text": prompt_text,
             "prompt_text_chars": len(prompt_text),
             "evidence_summary": summarize_evidence(evidence) if self.evidence_mode == "qwen" else self._minimal_evidence(evidence),
@@ -376,9 +378,10 @@ class LocalGemmaProvider(VLMReviewProvider):
     def _compact_xy(x: float, y: float) -> list[float]:
         return [round(float(x), 1), round(float(y), 1)]
 
-    def _keyframe_data_urls(self, evidence: EventEvidence) -> list[str]:
+    @staticmethod
+    def _image_paths_to_data_urls(image_paths: list[str]) -> list[str]:
         urls: list[str] = []
-        for candidate in self._sent_image_paths(evidence):
+        for candidate in image_paths:
             path = Path(candidate)
             mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
             data = base64.b64encode(path.read_bytes()).decode("ascii")

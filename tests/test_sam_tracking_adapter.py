@@ -132,3 +132,69 @@ def test_track_mask_labels_accept_numeric_class_ids():
 
     assert mask is not None
     assert int(mask.sum()) == 64
+
+
+def test_sam2_video_tracker_accepts_numpy_prompt_boxes(monkeypatch):
+    from src.perception import sam_tracking_adapter
+    from src.perception.sam_tracking_adapter import _SAM2VideoMemoryTracker
+
+    class _Predictor:
+        def __init__(self):
+            self.boxes = []
+
+        def init_state(self, **kwargs):
+            return {}
+
+        def add_new_points_or_box(self, **kwargs):
+            self.boxes.append(kwargs["box"])
+
+        def propagate_in_video(self, state):
+            return iter(())
+
+    predictor = _Predictor()
+    monkeypatch.setattr(_SAM2VideoMemoryTracker, "_load_model", lambda self: predictor)
+    monkeypatch.setattr(sam_tracking_adapter, "_box_iou", lambda box, registered: 0.0)
+    tracker = _SAM2VideoMemoryTracker(
+        sam2_config="sam2_hiera_l.yaml",
+        sam2_checkpoint="weights/sam2_hiera_large.pt",
+        device="cpu",
+    )
+
+    tracker.initialize_video(
+        "examples/test1.mp4",
+        scan_prompts=[{"boxes": np.array([[1, 2, 3, 4], [10, 20, 30, 40]], dtype=np.float32)}],
+    )
+
+    assert len(predictor.boxes) == 2
+    assert tracker._has_objects is True
+
+
+def test_sam2_video_tracker_advances_to_requested_frame(monkeypatch):
+    from src.perception import sam_tracking_adapter
+    from src.perception.sam_tracking_adapter import _SAM2VideoMemoryTracker
+
+    class _Predictor:
+        def init_state(self, **kwargs):
+            return {}
+
+        def add_new_points_or_box(self, **kwargs):
+            return None
+
+        def propagate_in_video(self, state):
+            for frame_idx in range(5):
+                yield frame_idx, [9], np.ones((1, 1, 4, 4), dtype=np.float32) * frame_idx
+
+    monkeypatch.setattr(_SAM2VideoMemoryTracker, "_load_model", lambda self: _Predictor())
+    monkeypatch.setattr(sam_tracking_adapter, "_box_iou", lambda box, registered: 0.0)
+    tracker = _SAM2VideoMemoryTracker(
+        sam2_config="sam2_hiera_l.yaml",
+        sam2_checkpoint="weights/sam2_hiera_large.pt",
+        device="cpu",
+    )
+    tracker.initialize_video("examples/test1.mp4", scan_prompts=[{"boxes": np.array([[1, 2, 3, 4]], dtype=np.float32)}])
+
+    masks, _scores, ids = tracker.track_frame(3)
+
+    assert ids == [9]
+    assert tracker._last_output_frame_idx == 3
+    assert len(masks) == 1

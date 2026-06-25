@@ -91,6 +91,31 @@ def test_image_pipeline_can_use_sam_tracking_rule(monkeypatch, tmp_path):
     assert "sam_tracking" in evidence_text
 
 
+def test_image_sam_tracking_disables_sam2_video_memory(monkeypatch, tmp_path):
+    captured = {}
+
+    class _CaptureConfigAdapter(_FakeImageSAMTrackingAdapter):
+        def __init__(self, config):
+            super().__init__(config)
+            captured["sam2_enabled"] = config.sam2_enabled
+
+    monkeypatch.setattr(analyze_image, "SAMTrackingAdapter", _CaptureConfigAdapter)
+    image_path = tmp_path / "alarm.jpg"
+    cv2.imwrite(str(image_path), np.full((480, 640, 3), 245, dtype=np.uint8))
+
+    run_image_pipeline(
+        image_path=str(image_path),
+        camera_id="cam_img",
+        rules_path="configs/rules.example.yaml",
+        output_dir=str(tmp_path / "image_sam_no_sam2"),
+        vlm_provider="mock",
+        tracker="sam_tracking",
+        save_visualization=False,
+    )
+
+    assert captured["sam2_enabled"] is False
+
+
 def test_image_batch_pipeline_writes_summary(tmp_path):
     image_dir = tmp_path / "images"
     image_dir.mkdir()

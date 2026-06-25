@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from src.pipeline import analyze_event
+from src.vlm import pipeline_runner
 
 
 class BrokenProvider:
@@ -9,7 +10,7 @@ class BrokenProvider:
 
 
 def test_pipeline_vlm_failure_no_crash(monkeypatch, tmp_path):
-    monkeypatch.setattr(analyze_event, "build_vlm_provider", lambda **kwargs: BrokenProvider())
+    monkeypatch.setattr(pipeline_runner, "build_vlm_provider", lambda **kwargs: BrokenProvider())
     output = tmp_path / "event"
     result = analyze_event.run_pipeline(
         video_path="missing.mp4",

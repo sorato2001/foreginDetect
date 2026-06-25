@@ -107,9 +107,14 @@ cd ..
 git clone https://github.com/facebookresearch/sam2.git
 cd sam2
 pip install -e .
+pip install decord
 
 cd ../RailwayIntrusion_Tracking_SAM2
 ```
+
+`decord` is required by the SAM2 video predictor. Image-only SAMTracking uses
+YOLO object detection plus the rail/track segmentation model and disables SAM2
+streaming memory, so missing `decord` only affects video-mode SAM2 propagation.
 
 Python 3.10+ is recommended.
 
@@ -143,6 +148,7 @@ python -m src.pipeline.analyze_event \
   --sam-track-model weights/best.pt \
   --sam2-config sam2_hiera_l.yaml \
   --sam2-checkpoint weights/sam2_hiera_large.pt \
+  --sam-temporal-mode faithful \
   --sam-iou-threshold 0.10 \
   --sam-window-size 5 \
   --sam-confirm-count 3 \
@@ -160,6 +166,17 @@ outputs/sam_tracking_demo/sam_tracking_result.json
 If YOLO11/SAM2/`best.pt` weights are missing, the adapter degrades cleanly and
 records the reason in `sam_tracking_result.json.metadata` instead of stopping
 the STEAD pipeline.
+
+SAMTracking video timing modes:
+
+- `--sam-temporal-mode faithful` or `reference`: every frame runs YOLO object
+  detection, SAM2 frame propagation, rail/track mask segmentation, optical-flow
+  smoothing, mask-IoU judgment, and sliding-window confirmation. This is the
+  closest mode to `RailwayIntrusion_Tracking_SAM2/outputs/test_annotated.mp4`.
+- `--sam-temporal-mode fast`: SAM2 still advances frame by frame, but YOLO object
+  detection and rail/track segmentation can run at `--sam-sample-every` and
+  `--sam-track-mask-interval`, with cached detections/masks reused between
+  intervals.
 
 Image input:
 
@@ -478,11 +495,11 @@ branch or shared externally, rotate it before deployment.
 
 ```bash
   # video
-  python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda 
+  python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-temporal-mode faithful --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda 
 
-  python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
+  python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-temporal-mode fast --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
 
-  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300 
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300 
 
 
 
@@ -494,8 +511,8 @@ branch or shared externally, rotate it before deployment.
   # Gemma
 
   ## image
-  python -m src.pipeline.analyze_event --input-type image --image examples/RailFence4.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/gemma_local_2 --vlm_mode local  --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt  --sam-track-labels 1 --sam-imgsz 640 --sam-device cuda
+  python -m src.pipeline.analyze_event --input-type image --image examples/RAIL_INTRUED.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test_img_1 --vlm_mode local  --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt  --sam-track-labels 1 --sam-imgsz 640 --sam-device cuda
   ## video
-  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_local_2 --vlm-mode local --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test --vlm-mode local --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300
   
 ```

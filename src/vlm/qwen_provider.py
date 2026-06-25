@@ -72,7 +72,7 @@ class QwenProvider(VLMReviewProvider):
             return self._fallback_review(evidence, "MissingAPIKey", f"{self.api_key_env} is not configured", retry_count=0)
 
         vlm_input = self._vlm_input_metadata(evidence)
-        payload = self._payload(evidence)
+        payload = self._payload(evidence, vlm_input=vlm_input)
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -139,10 +139,11 @@ class QwenProvider(VLMReviewProvider):
         fallback.metadata["vlm_input"] = vlm_input
         return fallback
 
-    def _payload(self, evidence: EventEvidence) -> dict[str, Any]:
+    def _payload(self, evidence: EventEvidence, vlm_input: dict[str, Any] | None = None) -> dict[str, Any]:
         """Build DashScope compatible chat payload."""
-        prompt = build_review_prompt(evidence)
-        image_url = self._first_keyframe_data_url(evidence)
+        vlm_input = vlm_input or self._vlm_input_metadata(evidence)
+        prompt = vlm_input["prompt_text"]
+        image_url = self._image_path_to_data_url(vlm_input["image_paths"][0]) if vlm_input["image_paths"] else None
         content: str | list[dict[str, Any]]
         if image_url:
             content = [
@@ -174,15 +175,13 @@ class QwenProvider(VLMReviewProvider):
         }
 
     @staticmethod
-    def _first_keyframe_data_url(evidence: EventEvidence) -> str | None:
-        """Return the first local keyframe encoded as a data URL."""
-        image_path = QwenProvider._first_keyframe_path(evidence)
-        if image_path:
-            path = Path(image_path)
-            mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
-            data = base64.b64encode(path.read_bytes()).decode("ascii")
-            return f"data:{mime};base64,{data}"
-        return None
+    @staticmethod
+    def _image_path_to_data_url(image_path: str) -> str:
+        """Return one local image encoded as a data URL."""
+        path = Path(image_path)
+        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{data}"
 
     @staticmethod
     def _first_keyframe_path(evidence: EventEvidence) -> str | None:

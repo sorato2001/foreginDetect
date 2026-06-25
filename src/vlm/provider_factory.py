@@ -8,6 +8,25 @@ from src.vlm.qwen_provider import QwenProvider
 from src.vlm.review_provider import VLMReviewProvider
 
 
+def resolve_vlm_provider(vlm_provider: str = "auto", vlm_mode: str = "web") -> str:
+    """Resolve VLM provider shorthand and reject conflicting mode/provider pairs."""
+    provider_name = (vlm_provider or "auto").lower()
+    mode = (vlm_mode or "web").lower()
+    if provider_name == "auto":
+        return "qwen" if mode == "web" else "gemma"
+    if provider_name == "mock":
+        return "mock"
+    if provider_name == "qwen":
+        if mode != "web":
+            raise ValueError("--vlm-provider qwen requires --vlm-mode web")
+        return "qwen"
+    if provider_name in {"gemma", "local_gemma"}:
+        if mode != "local":
+            raise ValueError("--vlm-provider gemma requires --vlm-mode local")
+        return "gemma"
+    raise ValueError(f"Unsupported --vlm-provider: {vlm_provider}")
+
+
 def build_vlm_provider(
     vlm_provider: str = "mock",
     vlm_mode: str = "web",
@@ -21,15 +40,11 @@ def build_vlm_provider(
     local_evidence_mode: str = "minimal",
 ) -> VLMReviewProvider:
     """Build a VLM provider from an explicit, non-conflicting mode/provider pair."""
-    provider_name = (vlm_provider or "mock").lower()
     mode = (vlm_mode or "web").lower()
-    if provider_name == "auto":
-        provider_name = "qwen" if mode == "web" else "gemma"
+    provider_name = resolve_vlm_provider(vlm_provider, mode)
     if provider_name == "mock":
         return MockVLMProvider()
-    if provider_name in {"gemma", "local_gemma"}:
-        if mode != "local":
-            raise ValueError("Gemma/local_gemma provider requires vlm_mode='local'")
+    if provider_name == "gemma":
         return LocalGemmaProvider(
             endpoint=local_endpoint,
             model=local_model,
@@ -40,10 +55,6 @@ def build_vlm_provider(
             max_images=local_max_images,
             evidence_mode=local_evidence_mode,
         )
-    if provider_name != "qwen":
-        raise ValueError(f"Unsupported VLM provider: {vlm_provider}")
-    if mode != "web":
-        raise ValueError("Qwen provider requires vlm_mode='web'")
     return QwenProvider(
         timeout_sec=timeout_sec,
         read_timeout_seconds=timeout_sec,

@@ -45,12 +45,14 @@ def save_pipeline_visualization(
         import numpy as np
 
         rules_config = _load_rules(rules_path)
-        sam_tracking = _load_sam_tracking(evidence)
+        use_sam_mask_rule = _uses_sam_mask_rule(evidence)
+        sam_tracking = _load_sam_tracking(evidence) if use_sam_mask_rule else None
         image = _load_background(video_path, evidence, cv2, np, image_path=image_path)
-        if not _uses_sam_mask_rule(evidence):
+        if not use_sam_mask_rule:
             _draw_rois(image, rules_config, cv2, np)
             _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
-        _draw_sam_tracking_overlay(image, _nearest_sam_frame(sam_tracking, 0), cv2, np)
+        else:
+            _draw_sam_tracking_overlay(image, _nearest_sam_frame(sam_tracking, 0), cv2, np)
         _draw_rule_status(image, evidence, cv2)
         cv2.imwrite(str(overview_path), image)
         annotated = _write_annotated_video(
@@ -109,12 +111,14 @@ def save_image_visualization(
         import numpy as np
 
         rules_config = _load_rules(rules_path)
-        sam_tracking = _load_sam_tracking(evidence)
+        use_sam_mask_rule = _uses_sam_mask_rule(evidence)
+        sam_tracking = _load_sam_tracking(evidence) if use_sam_mask_rule else None
         image = _load_background(None, evidence, cv2, np, image_path=image_path)
-        if not _uses_sam_mask_rule(evidence):
+        if not use_sam_mask_rule:
             _draw_rois(image, rules_config, cv2, np)
             _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
-        _draw_sam_tracking_overlay(image, _nearest_sam_frame(sam_tracking, 0), cv2, np)
+        else:
+            _draw_sam_tracking_overlay(image, _nearest_sam_frame(sam_tracking, 0), cv2, np)
         _draw_rule_status(image, evidence, cv2)
         cv2.imwrite(str(annotated_path), image)
     except Exception as exc:  # pragma: no cover - visualization should never block pipeline
@@ -351,7 +355,8 @@ def _write_annotated_video(
         if not _uses_sam_mask_rule(evidence):
             _draw_rois(frame, rules_config, cv2, np)
             _draw_tracks_and_boxes(frame, evidence, cv2, timestamp=timestamp)
-        _draw_sam_tracking_overlay(frame, _nearest_sam_frame(sam_tracking, frame_index), cv2, np)
+        else:
+            _draw_sam_tracking_overlay(frame, _sam_frame_for_video_index(sam_tracking, frame_index), cv2, np)
         _draw_rule_status(frame, evidence, cv2)
         cv2.putText(frame, f"t={timestamp:.2f}s frame={frame_index}", (20, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2)
         writer.write(frame)
@@ -378,6 +383,31 @@ def _nearest_sam_frame(sam_tracking: dict[str, Any] | None, frame_index: int) ->
         if idx > frame_index and gap > best_gap:
             break
     return best
+
+
+def _sam_frame_for_video_index(sam_tracking: dict[str, Any] | None, frame_index: int) -> dict[str, Any] | None:
+    """Return the exact SAMTracking frame for video rendering.
+
+    Video visualizations should not smear sampled masks across skipped frames.
+    A fallback to the nearest frame is only kept for old artifacts that do not
+    contain dense per-frame SAMTracking results.
+    """
+    if not sam_tracking:
+        return None
+    frames = sam_tracking.get("frames") or []
+    if not frames:
+        return None
+    index = sam_tracking.get("_frame_index_map")
+    if index is None:
+        index = {int(item.get("frame_index", 0)): item for item in frames}
+        sam_tracking["_frame_index_map"] = index
+    exact = index.get(int(frame_index))
+    if exact is not None:
+        return exact
+    metadata = sam_tracking.get("metadata") or {}
+    if metadata.get("temporal_mode") in {"fast", "faithful", "reference"}:
+        return None
+    return _nearest_sam_frame(sam_tracking, frame_index)
 
 
 def _draw_sam_tracking_overlay(image: Any, sam_frame: dict[str, Any] | None, cv2: Any, np: Any) -> None:

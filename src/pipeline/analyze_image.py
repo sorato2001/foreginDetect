@@ -22,14 +22,13 @@ from src.perception.sam_tracking_adapter import SAMTrackingAdapter, SAMTrackingC
 from src.perception.yolo_detector import YoloDetector
 from src.pipeline.analyze_event import (
     _configure_pipeline_logging,
-    _pipeline_fallback_review,
-    _resolve_vlm_provider,
     _sam_tracking_mask_iou_rule,
     _sam_tracking_prompt_summary,
     logger,
 )
 from src.rules.rule_engine import RuleEngine
-from src.vlm.provider_factory import build_vlm_provider
+from src.vlm.pipeline_runner import run_vlm_review
+from src.vlm.provider_factory import resolve_vlm_provider
 from src.visualization.pipeline_visualizer import save_image_visualization
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -126,7 +125,7 @@ def run_image_pipeline(
     out = ensure_output_dir(output_dir)
     log_path = _configure_pipeline_logging(out, log_level=log_level)
     pipeline_start = time.perf_counter()
-    effective_vlm_provider = _resolve_vlm_provider(vlm_provider, vlm_mode)
+    effective_vlm_provider = resolve_vlm_provider(vlm_provider, vlm_mode)
     logger.info(
         "STEP 01 start: event_id=%s camera_id=%s image=%s output=%s vlm_provider=%s vlm_mode=%s",
         event_id,
@@ -263,36 +262,18 @@ def run_image_pipeline(
 
     step_start = time.perf_counter()
     logger.info("STEP 07 VLM: begin provider=%s mode=%s timeout=%.1fs max_retries=%s", effective_vlm_provider, vlm_mode, vlm_timeout, vlm_max_retries)
-    provider = build_vlm_provider(
+    review, effective_vlm_provider = run_vlm_review(
+        evidence=evidence,
+        output_dir=out,
         vlm_provider=effective_vlm_provider,
         vlm_mode=vlm_mode,
         timeout_sec=vlm_timeout,
         max_retries=vlm_max_retries,
         fallback_on_error=vlm_fallback_on_error,
-        artifact_dir=str(out),
         local_endpoint=vlm_local_endpoint,
         local_model=vlm_local_model,
         local_max_images=vlm_local_max_images,
     )
-    try:
-        review = provider.review(evidence)
-    except Exception as exc:
-        logger.exception("STEP 07 VLM: provider raised unexpectedly, using image pipeline fallback")
-        provider_name = "local_gemma" if vlm_mode == "local" and effective_vlm_provider != "mock" else effective_vlm_provider
-        review = _pipeline_fallback_review(exc, provider_name=provider_name)
-        if effective_vlm_provider == "qwen" or vlm_mode == "local":
-            error_filename = "gemma_error.json" if provider_name == "local_gemma" else "qwen_error.json"
-            save_json(
-                {
-                    "provider": provider_name,
-                    "success": False,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc)[:500],
-                    "fallback": True,
-                    "pipeline_fallback": True,
-                },
-                str(out / error_filename),
-            )
     logger.info(
         "STEP 07 VLM: done level=%s confidence=%.3f success=%s fallback=%s elapsed=%.3fs",
         review.alarm_level_suggestion,
