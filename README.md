@@ -100,23 +100,116 @@ pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorc
 # CPU only
 pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cpu
 
+python -m ensurepip --upgrade
+python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
+```
 
-# SAM2 Installation
+Python 3.10 or 3.11 is recommended for the full GroundingDINO/SAM2 stack. Python
+3.12 can work in the current STEAD environment, but GroundingDINO editable
+builds are more fragile. Python 3.13 is not recommended.
+
+### SAM2
+
+Install SAM2 into the same virtual environment:
+
+```bash
 cd ..
-git clone https://github.com/facebookresearch/sam2.git
-cd sam2
-pip install -e .
-pip install decord
+git clone https://github.com/facebookresearch/segment-anything-2.git sam2-main
+cd sam2-main
+python -m pip install -e .
+python -m pip install decord
 
-cd ../RailwayIntrusion_Tracking_SAM2
+cd ../multi_camera_event_system
+```
+
+If this repository already has `../sam2-main`, install that existing copy
+instead:
+
+```bash
+cd ../sam2-main
+python -m pip install -e .
+python -m pip install decord
+cd ../multi_camera_event_system
+```
+
+Verify SAM2:
+
+```bash
+python -c "from sam2.build_sam import build_sam2; from sam2.sam2_image_predictor import SAM2ImagePredictor; print('SAM2 OK')"
 ```
 
 `decord` is required by the SAM2 video predictor. Image-only SAMTracking uses
 YOLO object detection plus the rail/track segmentation model and disables SAM2
 streaming memory, so missing `decord` only affects video-mode SAM2 propagation.
 
-Python 3.10+ is recommended.
+### GroundingDINO
+
+GroundingDINO is used by the optional guard-net/fence open-vocabulary
+segmentation script:
+
+```text
+../GroundingDINO/fence_grounded_sam.py
+```
+
+Install GroundingDINO into the same `multi_camera_event_system` virtual
+environment. Use `python -m pip`, not bare `pip`, so the active venv is used:
+
+```bash
+cd ../../GroundingDINO
+
+python -m ensurepip --upgrade
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements-fixed.txt
+
+# Important: install torch first, then disable build isolation for GroundingDINO.
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -e . --no-build-isolation
+```
+
+For CPU-only installation, replace the PyTorch command with:
+
+```bash
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+```
+
+Verify GroundingDINO:
+
+```bash
+python -c "from groundingdino.util.inference import load_model, predict; print('GroundingDINO OK')"
+```
+
+Common install issue:
+
+```text
+No module named pip
+No module named torch
+Getting requirements to build editable did not run successfully
+```
+
+Fix it by repairing `pip`, installing `torch` first, and running:
+
+```bash
+python -m pip install -e . --no-build-isolation
+```
+
+Run the guard-net/fence segmentation demo:
+
+```bash
+cd ../../GroundingDINO
+python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg --text-prompt "entire continuous black metal chain link fence. full fence line. complete wire mesh barrier. long protective mesh fence. continuous guard net along the field boundary. fence panels and posts." --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85
+```
+
+With ROI:
+
+```bash
+python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg --crop-roi 0,200,1920,1000 --text-prompt "entire continuous black metal chain link fence. full fence line. complete wire mesh barrier. long protective mesh fence. continuous guard net along the field boundary. fence panels and posts." --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85
+```
+
+By default, `fence_grounded_sam.py` uses `--selection-mode best`, so
+`mask_all.png`, `fence_grounded_sam_vis.jpg`, and YOLO-seg labels are generated
+from the highest ranked full-fence candidate. Use `--selection-mode all` only
+when you intentionally want to merge every kept GroundingDINO candidate.
 
 ## Mock Demo
 
@@ -146,6 +239,7 @@ python -m src.pipeline.analyze_event \
   --tracker sam_tracking \
   --sam-object-model weights/yolo11l.pt \
   --sam-track-model weights/best.pt \
+  --sam-track-labels 1 \
   --sam2-config sam2_hiera_l.yaml \
   --sam2-checkpoint weights/sam2_hiera_large.pt \
   --sam-temporal-mode faithful \
@@ -337,6 +431,7 @@ python -m src.pipeline.analyze_event \
   --track sam_tracking \
   --sam-object-model weights/yolo11l.pt \
   --sam-track-model weights/best.pt \
+  --sam-track-labels 1 \
   --sam2-enabled true \
   --sam2-config sam2_hiera_l.yaml \
   --sam2-checkpoint weights/sam2_hiera_large.pt \
@@ -495,11 +590,11 @@ branch or shared externally, rotate it before deployment.
 
 ```bash
   # video
-  python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-temporal-mode faithful --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda 
+  python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-temporal-mode faithful --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda 
 
-  python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-temporal-mode fast --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
+  python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-temporal-mode fast --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
 
-  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300 
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300 
 
 
 
@@ -513,6 +608,11 @@ branch or shared externally, rotate it before deployment.
   ## image
   python -m src.pipeline.analyze_event --input-type image --image examples/RAIL_INTRUED.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test_img_1 --vlm_mode local  --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt  --sam-track-labels 1 --sam-imgsz 640 --sam-device cuda
   ## video
-  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test --vlm-mode local --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test --vlm-mode local --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300
   
+  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_4 --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12
+
+  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_continuous_fix --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-bins 64 --continuous-band-margin 8
+  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_linefit_1 --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-bins 64 --continuous-band-margin 4 --continuous-band-min-height-ratio 0.12 --continuous-band-max-height-ratio 0.32
+  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_linefit_2 --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-bins 64 --continuous-band-margin 2 --continuous-band-min-height-ratio 0.10 --continuous-band-max-height-ratio 0.26
 ```
