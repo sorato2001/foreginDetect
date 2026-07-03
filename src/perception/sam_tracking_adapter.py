@@ -16,6 +16,7 @@ masks so the rest of the STEAD demo still runs and records a degraded status.
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -71,6 +72,8 @@ class SAMTrackingConfig:
 
     object_model_path: str = "../RailwayIntrusion_Tracking_SAM2/weights/yolo11l.pt"
     track_model_path: str = "../RailwayIntrusion_Tracking_SAM2/weights/best.pt"
+    rule_region_source: str = "sam_track"
+    rule_region_source_requested: str = "sam_track"
     sam2_config: str | None = None
     sam2_checkpoint: str | None = None
     device: str = "cuda"
@@ -92,6 +95,20 @@ class SAMTrackingConfig:
     track_mask_interval: int = 30
     imgsz: int = 640
     progress_interval: int = 10
+    output_dir: str | None = None
+    guard_net_text_prompt: str = (
+        "black chain link fence mesh wires. black metal mesh fence posts. "
+        "continuous wire guard net. protective wire mesh barrier. fence panels."
+    )
+    guard_net_box_threshold: float = 0.12
+    guard_net_text_threshold: float = 0.12
+    guard_net_max_box_area_ratio: float = 0.85
+    guard_net_candidate_count: int = 12
+    guard_net_crop_roi: str | None = None
+    guard_net_mask_output_mode: str = "continuous-band"
+    guard_net_continuous_band_margin: int = 4
+    guard_net_continuous_band_endpoint_source: str = "largest-component"
+    guard_net_save_selected_sam_mask: bool = False
 
 
 @dataclass(slots=True)
@@ -108,6 +125,9 @@ class SAMFrameResult:
     suspicious: bool
     window_count: int
     alarm: bool
+    rule_region_source: str = "sam_track"
+    rule_region_available: bool = False
+    rule_region_mask_area: int = 0
     track_mask_contours: list[list[list[int]]] = field(default_factory=list)
     object_mask_contours: list[list[list[list[int]]]] = field(default_factory=list)
 
@@ -256,7 +276,9 @@ class SAMTrackingAdapter:
         self._sam2_error: str | None = None
         self._runtime_device = self._resolve_device(self.config.device)
         self._sam2_tracker: _SAM2VideoMemoryTracker | None = None
+        self._sam2_temp_video: Path | None = None
         self._smoothers: dict[int, _OpticalFlowProbabilitySmoother] = {}
+        self._guard_net_result: Any | None = None
         self._load_models()
 
     def analyze_video(self, video_path: str, max_frames: int | None = 900) -> SAMTrackingResult:
@@ -310,7 +332,7 @@ class SAMTrackingAdapter:
         detection_seen = False
         cached_track_mask: Any | None = None
         if self.config.sam2_enabled:
-            self._initialize_sam2_video(video_path, fps, max_frames)
+            self._initialize_sam2_video(video_path, fps, max_frames, total_frames=total_frames)
         logger.info(
             "SAMTracking analyze start: video=%s fps=%.3f total_frames=%s max_frames=%s temporal_mode=%s sample_every=%s track_mask_interval=%s track_mask_enabled=%s device=%s imgsz=%s",
             video_path,
@@ -365,18 +387,23 @@ class SAMTrackingAdapter:
             state = judge.update(frame_index, max_iou, max_object_overlap=max_object_overlap)
             track_mask_contours = mask_to_contours(track_mask) if track_mask is not None else []
             object_mask_contours = [mask_to_contours(mask) for mask in object_masks]
+            rule_region_available = track_mask is not None and bool(np.asarray(track_mask).sum() > 0)
+            rule_region_mask_area = int(np.asarray(track_mask).sum()) if track_mask is not None else 0
             frames.append(
                 SAMFrameResult(
                     frame_index=frame_index,
                     timestamp=timestamp,
                     detections=[_detection_to_dict(det) for det in detections],
                     object_mask_count=len(object_masks),
-                    track_mask_available=track_mask is not None and bool(np.asarray(track_mask).sum() > 0),
+                    track_mask_available=rule_region_available,
                     max_iou=max_iou,
                     max_object_overlap=max_object_overlap,
                     suspicious=bool(state["suspicious"]),
                     window_count=int(state["window_count"]),
                     alarm=bool(state["alarm"]),
+                    rule_region_source=self.config.rule_region_source,
+                    rule_region_available=rule_region_available,
+                    rule_region_mask_area=rule_region_mask_area,
                     track_mask_contours=track_mask_contours,
                     object_mask_contours=object_mask_contours,
                 )
@@ -397,7 +424,8 @@ class SAMTrackingAdapter:
 
         cap.release()
         duration = frame_index / fps if fps > 0 else 0.0
-        degraded = self._object_model is None or self._track_model is None or self._sam2_error is not None
+        needs_track_model = (self.config.rule_region_source or "sam_track") == "sam_track"
+        degraded = self._object_model is None or (needs_track_model and self._track_model is None) or self._sam2_error is not None
         metadata = self._metadata(degraded=degraded)
         metadata.update(
             {
@@ -408,11 +436,13 @@ class SAMTrackingAdapter:
                 "track_mask_interval": track_mask_interval,
                 "track_mask_enabled": track_mask_enabled,
                 "track_mask_seen": track_mask_seen,
+                "rule_region_available": track_mask_seen,
                 "detections_seen": detection_seen,
                 "fallback_to_bbox_mask": self.config.fallback_to_bbox_mask,
                 "sam2_mode": "streaming_memory" if self._sam2_tracker is not None else "bbox_mask",
             }
         )
+        self._cleanup_sam2_temp_video()
         return SAMTrackingResult(
             tracks=tracks,
             fps=fps,
@@ -468,6 +498,7 @@ class SAMTrackingAdapter:
             max_iou = 0.0
             max_object_overlap = 0.0
         state = judge.update(frame_index, max_iou, max_object_overlap=max_object_overlap)
+        rule_region_mask_area = int(np.asarray(track_mask).sum()) if track_mask is not None else 0
         frames = [
             SAMFrameResult(
                 frame_index=frame_index,
@@ -480,11 +511,15 @@ class SAMTrackingAdapter:
                 suspicious=bool(state["suspicious"]),
                 window_count=int(state["window_count"]),
                 alarm=bool(state["alarm"]),
+                rule_region_source=self.config.rule_region_source,
+                rule_region_available=track_mask_seen,
+                rule_region_mask_area=rule_region_mask_area,
                 track_mask_contours=mask_to_contours(track_mask) if track_mask is not None else [],
                 object_mask_contours=[mask_to_contours(mask) for mask in object_masks],
             )
         ]
-        degraded = self._object_model is None or self._track_model is None
+        needs_track_model = (self.config.rule_region_source or "sam_track") == "sam_track"
+        degraded = self._object_model is None or (needs_track_model and self._track_model is None)
         metadata = self._metadata(degraded=degraded)
         metadata.update(
             {
@@ -495,6 +530,7 @@ class SAMTrackingAdapter:
                 "track_mask_interval": 1,
                 "track_mask_enabled": True,
                 "track_mask_seen": track_mask_seen,
+                "rule_region_available": track_mask_seen,
                 "detections_seen": detection_seen,
                 "fallback_to_bbox_mask": self.config.fallback_to_bbox_mask,
                 "sam2_mode": "single_image_bbox_or_static_mask",
@@ -543,6 +579,11 @@ class SAMTrackingAdapter:
 
     def detect_track_mask(self, frame: Any) -> Any | None:
         """Segment railway/track region with best.pt when available."""
+        source = (self.config.rule_region_source or "sam_track").strip().lower()
+        if source == "yaml":
+            return None
+        if source == "guard_net":
+            return self._detect_guard_net_mask(frame)
         if self._track_model is None:
             return None
         try:
@@ -603,6 +644,49 @@ class SAMTrackingAdapter:
             logger.warning("SAMTracking track segmentation failed: %s", exc)
             return None
 
+    def _detect_guard_net_mask(self, frame: Any) -> Any | None:
+        """Generate or reuse a GroundingDINO + SAM2 guard-net rule mask."""
+        if self._guard_net_result is not None:
+            return getattr(self._guard_net_result, "mask", None)
+        try:
+            from src.perception.guard_net_region_adapter import GuardNetRegionAdapter, GuardNetRegionConfig
+
+            config = GuardNetRegionConfig(
+                text_prompt=self.config.guard_net_text_prompt,
+                box_threshold=self.config.guard_net_box_threshold,
+                text_threshold=self.config.guard_net_text_threshold,
+                max_box_area_ratio=self.config.guard_net_max_box_area_ratio,
+                candidate_count=self.config.guard_net_candidate_count,
+                crop_roi=self.config.guard_net_crop_roi,
+                mask_output_mode=self.config.guard_net_mask_output_mode,
+                continuous_band_margin=self.config.guard_net_continuous_band_margin,
+                continuous_band_endpoint_source=self.config.guard_net_continuous_band_endpoint_source,
+                save_selected_sam_mask=self.config.guard_net_save_selected_sam_mask,
+            )
+            output_dir = Path(self.config.output_dir) / "guard_net" if self.config.output_dir else None
+            adapter = GuardNetRegionAdapter(
+                config,
+                sam2_config=self.config.sam2_config,
+                sam2_checkpoint=self.config.sam2_checkpoint,
+                device=self._runtime_device,
+                output_dir=output_dir,
+            )
+            self._guard_net_result = adapter.analyze_frame(frame, frame_index=0)
+            if not self._guard_net_result.available:
+                logger.warning("Guard-net rule region unavailable: %s", self._guard_net_result.fallback_reason)
+                return None
+            logger.info(
+                "Guard-net rule region ready: candidate=%s score=%s mode=%s",
+                self._guard_net_result.selected_candidate_index,
+                self._guard_net_result.selection_score,
+                self._guard_net_result.mask_output_mode,
+            )
+            return self._guard_net_result.mask
+        except Exception as exc:
+            logger.warning("Guard-net rule region failed: %s", exc)
+            self._guard_net_result = None
+            return None
+
     def segment_objects(
         self,
         frame: Any,
@@ -659,7 +743,11 @@ class SAMTrackingAdapter:
             return
 
         self._object_model = self._try_load_yolo(YOLO, self.config.object_model_path, "object")
-        self._track_model = self._try_load_yolo(YOLO, self.config.track_model_path, "track")
+        if (self.config.rule_region_source or "sam_track") == "sam_track":
+            self._track_model = self._try_load_yolo(YOLO, self.config.track_model_path, "track")
+        else:
+            self._track_model = None
+            self._track_model_error = f"not_used_for_rule_region_source:{self.config.rule_region_source}"
         self._sam2_error = self._probe_sam2()
 
     def _try_load_yolo(self, yolo_cls: Any, model_path: str, role: str) -> Any | None:
@@ -691,7 +779,13 @@ class SAMTrackingAdapter:
             return f"sam2_unavailable: {exc}"
         return None
 
-    def _initialize_sam2_video(self, video_path: str, fps: float, max_frames: int | None) -> None:
+    def _initialize_sam2_video(
+        self,
+        video_path: str,
+        fps: float,
+        max_frames: int | None,
+        total_frames: int = 0,
+    ) -> None:
         """Initialize SAM2 streaming memory tracker from first-frame YOLO prompts."""
         if self._sam2_error is not None or not self.config.sam2_enabled:
             return
@@ -700,6 +794,7 @@ class SAMTrackingAdapter:
             return
         try:
             scan_prompts = self._scan_initial_prompts(video_path, fps, max_frames)
+            sam2_video_path = self._prepare_sam2_video_source(video_path, max_frames, total_frames)
             tracker = _SAM2VideoMemoryTracker(
                 sam2_config=self.config.sam2_config,
                 sam2_checkpoint=self.config.sam2_checkpoint,
@@ -708,14 +803,75 @@ class SAMTrackingAdapter:
                 scan_frames=self.config.sam2_scan_frames,
                 new_obj_iou_thresh=self.config.sam2_new_object_iou_threshold,
             )
-            tracker.initialize_video(video_path, scan_prompts=scan_prompts)
+            tracker.initialize_video(sam2_video_path, scan_prompts=scan_prompts)
             self._sam2_tracker = tracker
             self._sam2_error = None
-            logger.info("SAM2 streaming memory tracker initialized: prompts=%s", len(scan_prompts))
+            logger.info("SAM2 streaming memory tracker initialized: prompts=%s video_source=%s", len(scan_prompts), sam2_video_path)
         except Exception as exc:
             self._sam2_tracker = None
             self._sam2_error = f"sam2_init_failed: {type(exc).__name__}: {exc}"
+            self._cleanup_sam2_temp_video()
             logger.warning("SAM2 initialization failed, fallback to bbox masks: %s", exc)
+
+    def _prepare_sam2_video_source(self, video_path: str, max_frames: int | None, total_frames: int = 0) -> str:
+        """Return a short clip for SAM2 when analysis is frame-limited.
+
+        SAM2's video predictor may initialize state for the whole source video.
+        When STEAD only analyzes the first N frames, feeding SAM2 a short clip
+        keeps CPU memory proportional to the actual analysis window.
+        """
+        if not max_frames or max_frames <= 0:
+            return video_path
+        if total_frames and max_frames >= total_frames:
+            return video_path
+        try:
+            import cv2
+        except Exception:
+            return video_path
+
+        source = Path(video_path)
+        temp_dir = Path(tempfile.mkdtemp(prefix="stead_sam2_clip_"))
+        temp_path = temp_dir / f"{source.stem}_first_{max_frames}.mp4"
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return video_path
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if width <= 0 or height <= 0:
+            cap.release()
+            return video_path
+
+        writer = cv2.VideoWriter(str(temp_path), cv2.VideoWriter_fourcc(*"mp4v"), max(1.0, fps), (width, height))
+        written = 0
+        while written < max_frames:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(frame)
+            written += 1
+        writer.release()
+        cap.release()
+        if written <= 0 or not temp_path.exists() or temp_path.stat().st_size <= 0:
+            return video_path
+        self._sam2_temp_video = temp_path
+        logger.info("SAM2 using frame-limited temp video: path=%s frames=%s/%s", temp_path, written, total_frames or "?")
+        return str(temp_path)
+
+    def _cleanup_sam2_temp_video(self) -> None:
+        """Remove the temporary SAM2 clip after video analysis finishes."""
+        temp_path = self._sam2_temp_video
+        self._sam2_temp_video = None
+        if temp_path is None:
+            return
+        try:
+            parent = temp_path.parent
+            if temp_path.exists():
+                temp_path.unlink()
+            if parent.exists():
+                parent.rmdir()
+        except Exception as exc:
+            logger.debug("Could not remove SAM2 temp video %s: %s", temp_path, exc)
 
     def _scan_initial_prompts(self, video_path: str, fps: float, max_frames: int | None) -> list[dict[str, Any]]:
         """Scan initial frames with YOLO11l and convert boxes to SAM2 prompts."""
@@ -761,12 +917,34 @@ class SAMTrackingAdapter:
         return smoother.smooth_mask(frame, mask)
 
     def _metadata(self, degraded: bool, error: str | None = None) -> dict[str, Any]:
+        requested = self.config.rule_region_source_requested or self.config.rule_region_source
+        resolved = self.config.rule_region_source or requested
+        guard_result = self._guard_net_result
+        guard_meta = getattr(guard_result, "metadata", None) if guard_result is not None else None
+        guard_available = bool(getattr(guard_result, "available", False)) if guard_result is not None else False
+        rule_region_available: bool | None
+        if resolved == "guard_net":
+            rule_region_available = guard_available
+        elif resolved == "sam_track":
+            rule_region_available = self._track_model is not None
+        else:
+            rule_region_available = False
+        if resolved == "guard_net" and guard_meta is None:
+            guard_meta = {
+                "enabled": True,
+                "fallback_reason": getattr(guard_result, "fallback_reason", None) if guard_result is not None else error,
+            }
+        rule_region_step = {
+            "yaml": "yaml_roi_rule_region",
+            "sam_track": "sam_track_segmentation_rule_region",
+            "guard_net": "groundingdino_sam2_guard_net_rule_region",
+        }.get(resolved, f"{resolved}_rule_region")
         return {
             "adapter": "sam_tracking",
             "pipeline": [
                 "video_frames",
                 "yolo11_object_detection",
-                "best_pt_rail_segmentation",
+                rule_region_step,
                 "sam2_or_bbox_mask_tracking",
                 "optical_flow_temporal_smoothing",
                 "mask_iou_intrusion_judgment",
@@ -774,6 +952,10 @@ class SAMTrackingAdapter:
             ],
             "degraded": degraded,
             "error": error,
+            "rule_region_source_requested": requested,
+            "rule_region_source_resolved": resolved,
+            "rule_region_available": rule_region_available,
+            "guard_net": guard_meta or {"enabled": resolved == "guard_net", "fallback_reason": None},
             "object_model_path": self.config.object_model_path,
             "track_model_path": self.config.track_model_path,
             "object_model_loaded": self._object_model is not None,

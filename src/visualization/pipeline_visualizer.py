@@ -27,11 +27,13 @@ def save_pipeline_visualization(
     animation_output_path = vis_dir / "evidence_animation.mp4"
     summary_path = vis_dir / "visualization_summary.json"
 
+    sam_tracking_meta = _sam_tracking_summary(evidence)
+    use_sam_overlay = _uses_sam_overlay(evidence)
     summary = {
         "rule_source": _rule_source(evidence),
         "detector_stage": _detector_summary(evidence),
-        "tracker_stage": None if _uses_sam_mask_rule(evidence) else _tracker_summary(evidence),
-        "sam_tracking_stage": _sam_tracking_summary(evidence) if _uses_sam_mask_rule(evidence) else None,
+        "tracker_stage": None if use_sam_overlay else _tracker_summary(evidence),
+        "sam_tracking_stage": sam_tracking_meta if use_sam_overlay else None,
         "rule_stage": [rule.model_dump(mode="json") for rule in evidence.roi_rules],
         "artifacts": {
             "pipeline_overview": str(overview_path),
@@ -45,10 +47,9 @@ def save_pipeline_visualization(
         import numpy as np
 
         rules_config = _load_rules(rules_path)
-        use_sam_mask_rule = _uses_sam_mask_rule(evidence)
-        sam_tracking = _load_sam_tracking(evidence) if use_sam_mask_rule else None
+        sam_tracking = _load_sam_tracking(evidence) if use_sam_overlay else None
         image = _load_background(video_path, evidence, cv2, np, image_path=image_path)
-        if not use_sam_mask_rule:
+        if not use_sam_overlay:
             _draw_rois(image, rules_config, cv2, np)
             _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
         else:
@@ -67,6 +68,10 @@ def save_pipeline_visualization(
         )
         if annotated:
             summary["artifacts"]["annotated_video"] = str(video_output_path)
+            summary["artifacts"]["annotated_video_rendering"] = _sam_visualization_rendering_summary(
+                sam_tracking,
+                max_video_frames=max_video_frames,
+            )
         animation = _write_evidence_animation(evidence, rules_config, animation_output_path, cv2, np, sam_tracking=sam_tracking)
         if animation:
             summary["artifacts"]["evidence_animation"] = str(animation_output_path)
@@ -96,12 +101,14 @@ def save_image_visualization(
     annotated_path = vis_dir / "annotated_image.jpg"
     summary_path = vis_dir / "visualization_summary.json"
 
+    sam_tracking_meta = _sam_tracking_summary(evidence)
+    use_sam_overlay = _uses_sam_overlay(evidence)
     summary = {
         "input_type": "image",
         "rule_source": _rule_source(evidence),
         "detector_stage": _detector_summary(evidence),
-        "tracker_stage": None if _uses_sam_mask_rule(evidence) else _tracker_summary(evidence),
-        "sam_tracking_stage": _sam_tracking_summary(evidence) if _uses_sam_mask_rule(evidence) else None,
+        "tracker_stage": None if use_sam_overlay else _tracker_summary(evidence),
+        "sam_tracking_stage": sam_tracking_meta if use_sam_overlay else None,
         "rule_stage": [rule.model_dump(mode="json") for rule in evidence.roi_rules],
         "artifacts": {"annotated_image": str(annotated_path)},
     }
@@ -111,10 +118,9 @@ def save_image_visualization(
         import numpy as np
 
         rules_config = _load_rules(rules_path)
-        use_sam_mask_rule = _uses_sam_mask_rule(evidence)
-        sam_tracking = _load_sam_tracking(evidence) if use_sam_mask_rule else None
+        sam_tracking = _load_sam_tracking(evidence) if use_sam_overlay else None
         image = _load_background(None, evidence, cv2, np, image_path=image_path)
-        if not use_sam_mask_rule:
+        if not use_sam_overlay:
             _draw_rois(image, rules_config, cv2, np)
             _draw_tracks_and_boxes(image, evidence, cv2, timestamp=None)
         else:
@@ -174,6 +180,8 @@ def _sam_tracking_summary(evidence: EventEvidence) -> dict[str, Any] | None:
         "processed_frames": sam_meta.get("processed_frames"),
         "intrusion_events": sam_meta.get("intrusion_events"),
         "track_mask_seen": sam_meta.get("track_mask_seen"),
+        "rule_region_source": sam_meta.get("rule_region_source"),
+        "rule_region_available": sam_meta.get("rule_region_available"),
         "detections_seen": sam_meta.get("detections_seen"),
     }
 
@@ -195,7 +203,17 @@ def _load_sam_tracking(evidence: EventEvidence) -> dict[str, Any] | None:
 
 
 def _uses_sam_mask_rule(evidence: EventEvidence) -> bool:
-    return evidence.metadata.get("rule_source") == "sam_tracking_mask_iou"
+    return str(evidence.metadata.get("rule_source", "")).endswith("_mask_iou")
+
+
+def _uses_sam_overlay(evidence: EventEvidence) -> bool:
+    """Draw segmentation rule-region overlays whenever SAMTracking has a mask."""
+    if _uses_sam_mask_rule(evidence):
+        return True
+    sam_meta = evidence.metadata.get("sam_tracking")
+    if not isinstance(sam_meta, dict):
+        return False
+    return bool(sam_meta.get("rule_region_available") or sam_meta.get("track_mask_seen"))
 
 
 def _rule_source(evidence: EventEvidence) -> str:
@@ -343,16 +361,22 @@ def _write_annotated_video(
     if width <= 0 or height <= 0:
         cap.release()
         return False
-    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), max(1.0, fps), (width, height))
+    render_stride = _sam_visualization_render_stride(sam_tracking)
+    output_fps = max(1.0, fps / max(1, render_stride))
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
     frame_index = 0
+    written = 0
     while True:
         if max_video_frames and frame_index >= max_video_frames:
             break
         ok, frame = cap.read()
         if not ok:
             break
+        if frame_index % render_stride != 0:
+            frame_index += 1
+            continue
         timestamp = frame_index / fps if fps > 0 else 0.0
-        if not _uses_sam_mask_rule(evidence):
+        if not _uses_sam_overlay(evidence):
             _draw_rois(frame, rules_config, cv2, np)
             _draw_tracks_and_boxes(frame, evidence, cv2, timestamp=timestamp)
         else:
@@ -360,6 +384,7 @@ def _write_annotated_video(
         _draw_rule_status(frame, evidence, cv2)
         cv2.putText(frame, f"t={timestamp:.2f}s frame={frame_index}", (20, height - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 2)
         writer.write(frame)
+        written += 1
         frame_index += 1
     writer.release()
     cap.release()
@@ -383,6 +408,39 @@ def _nearest_sam_frame(sam_tracking: dict[str, Any] | None, frame_index: int) ->
         if idx > frame_index and gap > best_gap:
             break
     return best
+
+
+def _sam_visualization_render_stride(sam_tracking: dict[str, Any] | None) -> int:
+    """Synchronize GuardNet fast-mode videos with sampled object detections."""
+    if not sam_tracking:
+        return 1
+    metadata = sam_tracking.get("metadata") or {}
+    if metadata.get("rule_region_source_resolved") != "guard_net":
+        return 1
+    if metadata.get("temporal_mode") != "fast":
+        return 1
+    try:
+        return max(1, int(metadata.get("sample_every") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _sam_visualization_rendering_summary(
+    sam_tracking: dict[str, Any] | None,
+    max_video_frames: int | None = None,
+) -> dict[str, Any]:
+    """Return metadata about annotated video frame sampling."""
+    stride = _sam_visualization_render_stride(sam_tracking)
+    metadata = sam_tracking.get("metadata") if isinstance(sam_tracking, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return {
+        "render_stride": stride,
+        "sync_with_fast_sample_every": stride > 1,
+        "source_temporal_mode": metadata.get("temporal_mode"),
+        "source_sample_every": metadata.get("sample_every"),
+        "source_frame_limit": max_video_frames,
+        "rule_region_source": metadata.get("rule_region_source_resolved"),
+    }
 
 
 def _sam_frame_for_video_index(sam_tracking: dict[str, Any] | None, frame_index: int) -> dict[str, Any] | None:
@@ -416,18 +474,32 @@ def _draw_sam_tracking_overlay(image: Any, sam_frame: dict[str, Any] | None, cv2
         return
     overlay = image.copy()
     track_contours = sam_frame.get("track_mask_contours") or []
+    rule_region_source = str(sam_frame.get("rule_region_source") or "sam_track")
+    alarm = bool(sam_frame.get("alarm"))
+    suspicious = bool(sam_frame.get("suspicious"))
+    rule_fill, rule_line = _rule_region_state_colors(alarm=alarm, suspicious=suspicious)
+    if rule_region_source == "guard_net":
+        mask_fill = rule_fill
+        mask_line = rule_line
+        mask_label = "guard-net rule region"
+    else:
+        mask_fill = rule_fill
+        mask_line = rule_line
+        mask_label = "segmentation rule region"
     for contour in track_contours:
         pts = np.array(contour, dtype=np.int32)
         if len(pts) >= 3:
-            cv2.fillPoly(overlay, [pts], (90, 80, 20))
-            cv2.polylines(image, [pts], True, (120, 90, 20), 3)
+            cv2.fillPoly(overlay, [pts], mask_fill)
+            cv2.polylines(image, [pts], True, mask_line, 3)
     object_contours = sam_frame.get("object_mask_contours") or []
+    object_fill = (0, 0, 220) if alarm or suspicious else (0, 180, 0)
+    object_line = (0, 0, 255) if alarm or suspicious else (0, 220, 0)
     for contour_group in object_contours:
         for contour in contour_group:
             pts = np.array(contour, dtype=np.int32)
             if len(pts) >= 3:
-                cv2.fillPoly(overlay, [pts], (0, 0, 220))
-                cv2.polylines(image, [pts], True, (0, 0, 255), 2)
+                cv2.fillPoly(overlay, [pts], object_fill)
+                cv2.polylines(image, [pts], True, object_line, 2)
     cv2.addWeighted(overlay, 0.35, image, 0.65, 0, image)
 
     for det in sam_frame.get("detections") or []:
@@ -441,8 +513,6 @@ def _draw_sam_tracking_overlay(image: Any, sam_frame: dict[str, Any] | None, cv2
         cv2.putText(image, label, (x1, max(28, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
     h, w = image.shape[:2]
-    alarm = bool(sam_frame.get("alarm"))
-    suspicious = bool(sam_frame.get("suspicious"))
     max_iou = float(sam_frame.get("max_iou", 0.0))
     max_object_overlap = float(sam_frame.get("max_object_overlap", 0.0))
     window_count = int(sam_frame.get("window_count", 0))
@@ -453,7 +523,7 @@ def _draw_sam_tracking_overlay(image: Any, sam_frame: dict[str, Any] | None, cv2
     cv2.rectangle(image, (12, h - 76), (min(w - 12, 720), h - 14), (20, 20, 20), -1)
     cv2.putText(
         image,
-        f"SAMTracking {status} | MaskIoU={max_iou:.3f} | ObjOverlap={max_object_overlap:.3f} | Window={window_count}",
+        f"{_rule_region_display_name(rule_region_source)} {status} | MaskIoU={max_iou:.3f} | ObjOverlap={max_object_overlap:.3f} | Window={window_count}",
         (24, h - 36),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,
@@ -461,7 +531,24 @@ def _draw_sam_tracking_overlay(image: Any, sam_frame: dict[str, Any] | None, cv2
         2,
     )
     if track_contours:
-        cv2.putText(image, "railway track mask", (24, h - 94), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 90, 20), 2)
+        cv2.putText(image, mask_label, (24, h - 94), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mask_line, 2)
+
+
+def _rule_region_state_colors(alarm: bool, suspicious: bool) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Return BGR fill/line colors for rule-region state visualization."""
+    if alarm:
+        return (0, 0, 220), (0, 0, 255)
+    if suspicious:
+        return (0, 190, 230), (0, 220, 255)
+    return (210, 120, 0), (255, 150, 0)
+
+
+def _rule_region_display_name(rule_region_source: str) -> str:
+    if rule_region_source == "guard_net":
+        return "GuardNet"
+    if rule_region_source == "sam_track":
+        return "SAMTrack"
+    return "SegRule"
 
 
 def _write_evidence_animation(
@@ -481,7 +568,7 @@ def _write_evidence_animation(
     for frame_idx in range(frame_count):
         timestamp = evidence.time_range[0] + (duration * frame_idx / max(1, frame_count - 1))
         frame = np.full((height, width, 3), 245, dtype=np.uint8)
-        if _uses_sam_mask_rule(evidence):
+        if _uses_sam_overlay(evidence):
             source_frame_index = _frame_index_for_timestamp(sam_tracking, timestamp)
             _draw_sam_tracking_overlay(frame, _nearest_sam_frame(sam_tracking, source_frame_index), cv2, np)
         else:

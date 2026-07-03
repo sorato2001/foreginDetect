@@ -4,8 +4,8 @@ STEAD is a research-oriented surveillance anomaly detection prototype. It turns
 an event video into structured temporal evidence, asks a VLM/LLM reviewer for a
 strict JSON review, and fuses rules plus model confidence into a graded alarm.
 
-中文定位：结构化时序证据驱动的监控异常检测与分级报警框架。
-
+Chinese summary: structured temporal evidence-guided surveillance anomaly
+detection and graded alarm framework.
 ## Pipeline
 
 ```text
@@ -24,7 +24,7 @@ Optional SAMTracking tracker mode:
 ```text
 event video frames
   -> YOLO11l detection (person/cow/sheep)
-  -> best.pt railway/track segmentation
+  -> rule-region segmentation (YAML, sam_track, or guard_net)
   -> SAM2 segmentation + streaming-memory tracking when configured
   -> optical-flow temporal mask smoothing
   -> mask-IoU intrusion judgment
@@ -36,24 +36,40 @@ Branch `STEAD_SAM2` embeds the RailwayIntrusion_Tracking_SAM2 method inside
 STEAD's detector/tracker path:
 
 - detector adapter: YOLO11l person/cow/sheep detection
-- track-region detector: `best.pt` railway/track segmentation
+- rule-region detector: YAML ROI, `best.pt`/`FenceRail.pt`, or GuardNet
 - tracker adapter: SAM2 video predictor with streaming memory
 - temporal smoothing: optical-flow guided probability fusion
 - rule source: mask-IoU plus object-overlap intrusion judgment and sliding-window confirmation
 
-When SAMTracking produces a railway/track mask, STEP 04 uses mask-IoU
+When SAMTracking produces a rule-region mask, STEP 04 uses mask-IoU
 intrusion judgment as the rule source:
 
 ```text
-object mask ∩ railway track mask
+object mask intersect rule-region mask
   -> max MaskIoU
   -> suspicious frame
   -> sliding-window confirmation
-  -> sam_mask_iou_intrusion rule
+  -> mask_iou_intrusion rule
 ```
 
 If no segmentation/track mask is available, STEP 04 automatically falls back to
 the polygon/line rules in the YAML config.
+
+Rule-region source can now be selected explicitly:
+
+- `--rule-region-source yaml`: use YAML polygon/line ROI rules only.
+- `--rule-region-source sam_track`: use the existing `--sam-track-model`
+  railway/track/fence-rail segmentation mask as the mask-IoU rule region.
+- `--rule-region-source guard_net`: use GroundingDINO + SAM2 guard-net
+  segmentation, then optional `continuous-band` endpoint fitting, as the
+  mask-IoU rule region.
+- `--rule-region-source auto`: resolve to guard-net only when guard-net options
+  are explicitly supplied; otherwise use `sam_track` when `--sam-track-model`
+  is supplied, then fall back to YAML.
+
+The resolved source is written to `sam_tracking_result.json.metadata` as
+`rule_region_source_requested`, `rule_region_source_resolved`, and
+`rule_region_available`.
 
 This branch is STEAD-only. Legacy RTSP/FTP recording code has been removed from
 this branch so the repository is focused on the research prototype.
@@ -197,19 +213,55 @@ Run the guard-net/fence segmentation demo:
 
 ```bash
 cd ../../GroundingDINO
-python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg --text-prompt "entire continuous black metal chain link fence. full fence line. complete wire mesh barrier. long protective mesh fence. continuous guard net along the field boundary. fence panels and posts." --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85
+python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg --text-prompt "black chain link fence mesh wires. black metal mesh fence posts. continuous wire guard net. protective wire mesh barrier. fence panels." --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85
 ```
 
 With ROI:
 
 ```bash
-python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg --crop-roi 0,200,1920,1000 --text-prompt "entire continuous black metal chain link fence. full fence line. complete wire mesh barrier. long protective mesh fence. continuous guard net along the field boundary. fence panels and posts." --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85
+python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg --crop-roi 0,200,1920,1000 --text-prompt "black chain link fence mesh wires. black metal mesh fence posts. continuous wire guard net. protective wire mesh barrier. fence panels." --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85
 ```
 
 By default, `fence_grounded_sam.py` uses `--selection-mode best`, so
 `mask_all.png`, `fence_grounded_sam_vis.jpg`, and YOLO-seg labels are generated
 from the highest ranked full-fence candidate. Use `--selection-mode all` only
 when you intentionally want to merge every kept GroundingDINO candidate.
+
+Fence mask output modes:
+
+- `--mask-output-mode sam`: save the selected raw SAM2 mask directly.
+- `--mask-output-mode continuous-band`: default. Select the best SAM2 candidate,
+  then fit a continuous fence band from the selected mask endpoints. The endpoint
+  fitter estimates left-top/right-top as the upper fence line and
+  left-bottom/right-bottom as the lower fence line, then fills the region between
+  the two lines.
+
+Useful continuous-band switches:
+
+- `--continuous-band-margin`: expands the final fitted band by a few pixels.
+- `--continuous-band-endpoint-source largest-component`: default; use the
+  largest connected SAM mask component to avoid isolated noise.
+- `--continuous-band-endpoint-source all-mask`: use all selected SAM mask pixels
+  so the fitted band extends to every raw-mask endpoint.
+- `--save-selected-sam-mask`: additionally save `sam_mask_0.png`, the raw SAM2
+  mask selected before continuous-band post-processing.
+
+Typical continuous fence-band command:
+
+```bash
+python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_endpoint_all_mask --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-margin 4 --continuous-band-endpoint-source all-mask --save-selected-sam-mask
+```
+
+Main outputs:
+
+```text
+outputs/<run>/mask_0.png                  # final selected mask, after post-processing
+outputs/<run>/mask_all.png                # merged final masks
+outputs/<run>/sam_mask_0.png              # optional raw selected SAM2 mask
+outputs/<run>/fence_grounded_sam_vis.jpg  # overlay visualization
+outputs/<run>/detections.json             # candidates, scores, selected indices, paths
+outputs/<run>/labels/<image_stem>.txt     # YOLO-seg label when enabled
+```
 
 ## Mock Demo
 
@@ -264,13 +316,17 @@ the STEAD pipeline.
 SAMTracking video timing modes:
 
 - `--sam-temporal-mode faithful` or `reference`: every frame runs YOLO object
-  detection, SAM2 frame propagation, rail/track mask segmentation, optical-flow
+  detection, SAM2 frame propagation, rule-region segmentation, optical-flow
   smoothing, mask-IoU judgment, and sliding-window confirmation. This is the
   closest mode to `RailwayIntrusion_Tracking_SAM2/outputs/test_annotated.mp4`.
 - `--sam-temporal-mode fast`: SAM2 still advances frame by frame, but YOLO object
-  detection and rail/track segmentation can run at `--sam-sample-every` and
+  detection and rule-region segmentation can run at `--sam-sample-every` and
   `--sam-track-mask-interval`, with cached detections/masks reused between
   intervals.
+
+Optical-flow smoothing uses OpenCV Farneback by default and runs efficiently on
+CPU; it does not require GPU. A future RAFT-style smoother would require GPU,
+but the current STEAD path does not use RAFT.
 
 Image input:
 
@@ -384,7 +440,7 @@ python -m src.pipeline.analyze_event \
   --vlm-local-endpoint http://localhost:8082/v1/chat/completions \
   --vlm-local-model gemma-4-26B \
   --vlm-timeout 600 \
-  --track sam_tracking \
+  --tracker sam_tracking \
   --sam-object-model weights/yolo11l.pt \
   --sam-track-model weights/FenceRail.pt \
   --sam-track-labels 1 \
@@ -428,7 +484,7 @@ python -m src.pipeline.analyze_event \
   --vlm-timeout 600 \
   --vlm-max-retries 2 \
   --vlm-fallback-on-error true \
-  --track sam_tracking \
+  --tracker sam_tracking \
   --sam-object-model weights/yolo11l.pt \
   --sam-track-model weights/best.pt \
   --sam-track-labels 1 \
@@ -514,6 +570,7 @@ Useful CLI switches:
 
 ```text
 --tracker simple_iou|sam_tracking
+--rule-region-source yaml|sam_track|guard_net|auto
 --sam-object-model <path-to-yolo11l.pt>
 --sam-track-model <path-to-best.pt>
 --sam2-config <path-to-sam2-config.yaml>
@@ -526,7 +583,89 @@ Useful CLI switches:
 --sam-window-size 5
 --sam-confirm-count 3
 --sam-use-optical-flow true
+--guard-net-box-threshold 0.12
+--guard-net-text-threshold 0.12
+--guard-net-max-box-area-ratio 0.85
+--guard-net-candidate-count 12
+--guard-net-mask-output-mode sam|continuous-band
+--guard-net-continuous-band-margin 4
+--guard-net-continuous-band-endpoint-source largest-component|all-mask
+--guard-net-save-selected-sam-mask true|false
 ```
+
+CLI 参数说明：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--input-type video/image` | 输入类型。`video` 走视频检测流程，`image` 走单图或图片目录批量流程。 |
+| `--video <path>` | 单个视频路径；当路径是目录时，会按视频批处理运行。 |
+| `--video-dir <dir>` | 视频批处理目录。会扫描目录内视频文件，并给每个视频创建独立输出子目录。 |
+| `--image <path>` | 单张图片路径；当路径是目录时，会按图片批处理运行。 |
+| `--recursive` | 批处理目录时递归扫描子目录。适用于 `--video-dir`、目录型 `--video`、目录型 `--image`。 |
+| `--batch-limit <n>` | 批处理最多处理多少个文件。`0` 表示不限制。 |
+| `--camera-id <id>` | 摄像头 ID，写入 evidence、日志和结果 JSON。 |
+| `--rules <yaml>` | YAML 规则文件路径。普通 ROI 规则从这里读取；GuardNet 模式下仍保留作为 fallback 和配置入口。 |
+| `--output <dir>` | 输出目录。单视频/单图直接写入该目录；批处理会在该目录下按文件名创建子目录，并生成 `batch_summary.json`。 |
+| `--event-id <id>` | 可选事件 ID；不传时自动生成。批处理会为每个文件自动生成独立 ID。 |
+| `--mock-detections` | 使用内置假检测结果，适合快速测试 CLI、日志、VLM 和输出结构，不调用真实检测模型。 |
+| `--no-visualization` | 跳过可视化输出，减少运行时间。 |
+| `--max-analysis-frames <n>` | 视频最多分析多少帧。`0` 表示完整视频；设置为正数时，SAM2 也只初始化对应长度的临时短视频，避免长视频占用过多内存。 |
+| `--visualization-max-frames <n>` | 可视化视频最多覆盖原视频时间轴上的前多少帧。`0` 表示完整视频；GuardNet fast 模式会在这个时间范围内按 `--sam-sample-every` 同步抽帧写出，输出时长不会超过已覆盖的原视频时长。 |
+| `--log-level DEBUG/INFO/WARNING/ERROR` | 日志等级。调试模型加载、规则来源、GuardNet fallback 时建议用 `INFO` 或 `DEBUG`。 |
+
+VLM 参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--vlm-provider auto/mock/qwen/gemma/local_gemma` | VLM 提供方。`mock` 不访问模型；`qwen` 走线上 API；`gemma/local_gemma` 走本地 Gemma 兼容接口。 |
+| `--vlm-mode web/local` | VLM 模式。`web` 对应线上 Qwen；`local` 对应局域网/本地 Gemma。 |
+| `--vlm-local-endpoint <url>` | 本地 Gemma 的 OpenAI-compatible chat completions endpoint。 |
+| `--vlm-local-model <name>` | 本地 Gemma 模型名，例如 `gemma-4-26B`。 |
+| `--vlm-local-max-images <n>` | 传给本地 VLM 的最多图片数量，用于控制上下文长度。 |
+| `--vlm-timeout <sec>` | VLM 请求超时时间。 |
+| `--vlm-max-retries <n>` | VLM 请求失败后的最大重试次数。 |
+| `--vlm-fallback-on-error true/false` | VLM 失败时是否生成 fallback review，避免整个 pipeline 中断。 |
+
+检测、跟踪和 SAMTracking 参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--tracker simple_iou/sam_tracking` | 跟踪器。`simple_iou` 是 bbox IoU 简单跟踪；`sam_tracking` 使用 YOLO + SAM/SAM2 mask 跟踪与规则区 mask IoU 判定。 |
+| `--rule-region-source yaml/sam_track/guard_net/auto` | 规则区域来源。`yaml` 使用规则文件 ROI；`sam_track` 使用 `--sam-track-model` 分割出的轨道/围栏 mask；`guard_net` 使用 GroundingDINO + SAM2 生成护网规则区；`auto` 自动选择。 |
+| `--sam-object-model <pt>` | 目标检测 YOLO 模型，通常用于检测人，例如 `weights/yolo11l.pt`。GuardNet 模式下 SAM/SAM2 仍主要处理人/目标。 |
+| `--sam-track-model <pt>` | `sam_track` 规则区域模型，例如轨道/围栏分割模型。`guard_net` 模式不使用这个参数。 |
+| `--sam-track-labels <ids>` | 从 `--sam-track-model` 中选择哪些类别合并为规则区域 mask，例如 `1`。多个类别用逗号写，如 `1,2`。 |
+| `--sam2-enabled true/false` | 是否启用 SAM2。开启后可使用 SAM2 streaming memory 进行视频 mask 推进。 |
+| `--sam2-config <yaml>` | SAM2 配置文件路径。建议使用真实 SAM2 repo 里的路径，例如 `../sam2-main/sam2/configs/sam2/sam2_hiera_l.yaml`。 |
+| `--sam2-checkpoint <pt>` | SAM2 checkpoint 路径，例如 `../sam2-main/checkpoints/sam2_hiera_large.pt`。 |
+| `--sam2-scan-frames <n>` | 初始化 SAM2 prompt 时扫描前多少帧收集目标框。 |
+| `--sam2-prompt-mode bounding_box/center_point/centroid` | 给 SAM2 的 prompt 类型。`bounding_box` 通常最稳定。 |
+| `--sam-temporal-mode fast/faithful/reference` | 视频时序模式。`faithful/reference` 每帧运行目标检测并逐帧做 mask 判定；`fast` 可以间隔运行目标检测，但 SAM2 仍逐帧推进。GuardNet 规则区通常由参考帧生成，不需要每帧重新检测。 |
+| `--sam-sample-every <n>` | `fast` 模式下每隔多少帧运行一次目标检测，主要影响人/目标检测频率。GuardNet fast 模式的 `annotated_pipeline.mp4` 也会按这个间隔同步抽帧写出。 |
+| `--sam-track-mask-interval <n>` | `fast` 模式下每隔多少帧更新一次 `sam_track` 规则区 mask。GuardNet 规则区通常来自参考帧。 |
+| `--sam-imgsz <n>` | YOLO 推理图片尺寸，例如 `640`。更大可能更准但更慢。 |
+| `--sam-device cuda/cpu` | 模型运行设备。SAM2/YOLO 建议用 `cuda`；Farneback 光流平滑本身在 CPU 上运行。 |
+| `--sam-iou-threshold <float>` | 目标 mask 与规则区域 mask 的 IoU 阈值，超过后判为 suspicious。 |
+| `--sam-object-overlap-threshold <float>` | 目标 mask 中有多少比例落入规则区域的阈值，超过后判为 suspicious。 |
+| `--sam-window-size <n>` | 连续帧确认窗口大小。 |
+| `--sam-confirm-count <n>` | 窗口内 suspicious 帧数量达到该值后触发 alarm。 |
+| `--sam-use-optical-flow true/false` | 是否启用光流平滑。当前 Farneback 光流在 CPU 上运行，不需要 GPU。 |
+| `--sam-progress-interval <n>` | 每处理多少帧打印一次 SAMTracking 进度日志。 |
+
+GuardNet 规则区域参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--guard-net-text-prompt <text>` | GroundingDINO 识别护网/围网的文本提示词。默认偏向 `chain link fence / wire mesh fence / protective net`。 |
+| `--guard-net-box-threshold <float>` | GroundingDINO bbox 置信度阈值。检测不到护网时可尝试降低到 `0.10`。 |
+| `--guard-net-text-threshold <float>` | GroundingDINO 文本匹配阈值。检测不到护网时可尝试降低到 `0.10`。 |
+| `--guard-net-max-box-area-ratio <float>` | 过滤过大检测框。`0.85` 表示候选框面积超过图片 85% 时过滤。 |
+| `--guard-net-candidate-count <n>` | 送入 SAM2 的候选框数量上限。更多候选可能覆盖更完整，但更慢。 |
+| `--guard-net-crop-roi x1,y1,x2,y2` | 可选护网 ROI。先裁剪指定区域再检测，适合画面里草地、树、人干扰明显的场景。 |
+| `--guard-net-mask-output-mode sam/continuous-band` | GuardNet 输出模式。`sam` 使用 SAM2 原始 mask；`continuous-band` 用护网 mask 端点拟合上下边界，生成连续护网带。 |
+| `--guard-net-continuous-band-margin <px>` | `continuous-band` 上下边界外扩像素，避免护网边缘被切掉。 |
+| `--guard-net-continuous-band-endpoint-source largest-component/all-mask` | 连续带端点来源。`largest-component` 只用最大连通域；`all-mask` 用整体 mask，更适合横向连续护网。 |
+| `--guard-net-save-selected-sam-mask true/false` | 是否保存最终被选中的 SAM mask，便于检查 GuardNet 规则区生成质量。 |
 
 ## Logs
 
@@ -590,29 +729,52 @@ branch or shared externally, rotate it before deployment.
 
 ```bash
   # video
-  python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-temporal-mode faithful --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda 
+  python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --tracker sam_tracking --sam-temporal-mode faithful --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda
 
-  python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --track sam_tracking --sam-temporal-mode fast --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
+  python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --tracker sam_tracking --sam-temporal-mode fast --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
 
-  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300 
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_sam2_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300
 
 
 
   # image
-  python -m src.pipeline.analyze_event --input-type image --image examples/RailFence1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/image_sam_tracking_rail --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt -sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda
+  python -m src.pipeline.analyze_event --input-type image --image examples/RailFence1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/image_sam_tracking_rail --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda
 
-  python -m src.pipeline.analyze_event --input-type image --image examples/K88+300-1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/K88+300-1 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1  --sam2-enabled true --sam-imgsz 640 --sam-device cuda
+  python -m src.pipeline.analyze_event --input-type image --image examples/K88+300-1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/K88+300-1 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1  --sam2-enabled true --sam-imgsz 640 --sam-device cuda
 
   # Gemma
 
   ## image
-  python -m src.pipeline.analyze_event --input-type image --image examples/RAIL_INTRUED.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test_img_1 --vlm_mode local  --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt  --sam-track-labels 1 --sam-imgsz 640 --sam-device cuda
+  python -m src.pipeline.analyze_event --input-type image --image examples/RAIL_INTRUED.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test_img_1 --vlm_mode local  --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt  --sam-track-labels 1 --sam-imgsz 640 --sam-device cuda
   ## video
-  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test --vlm-mode local --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --vlm-max-retries 2 --vlm-fallback-on-error true --track sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300
-  
-  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_4 --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/codeclean_test --vlm-mode local --vlm-local-endpoint http://localhost:8082/v1/chat/completions --vlm-local-model gemma-4-26B --vlm-timeout 600 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --max-analysis-frames 300 --visualization-max-frames 300
 
-  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_continuous_fix --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-bins 64 --continuous-band-margin 8
-  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_linefit_1 --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-bins 64 --continuous-band-margin 4 --continuous-band-min-height-ratio 0.12 --continuous-band-max-height-ratio 0.32
-  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_linefit_2 --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-bins 64 --continuous-band-margin 2 --continuous-band-min-height-ratio 0.10 --continuous-band-max-height-ratio 0.26
+  # STEAD guard-net rule-region source
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_guard_net_full --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights/yolo11l.pt --sam2-enabled true --sam2-config ../sam2-main/sam2/configs/sam2/sam2_hiera_l.yaml --sam2-checkpoint ../sam2-main/checkpoints/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --guard-net-box-threshold 0.12 --guard-net-text-threshold 0.12 --guard-net-max-box-area-ratio 0.85 --guard-net-candidate-count 12 --guard-net-mask-output-mode continuous-band --guard-net-continuous-band-margin 4 --guard-net-continuous-band-endpoint-source all-mask --guard-net-save-selected-sam-mask true --max-analysis-frames 300 --visualization-max-frames 300
+
+  python -m src.pipeline.analyze_event --input-type video --video examples/test2.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_guard_net_full_8 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights/yolo11l.pt --sam2-enabled true --sam2-config ../sam2-main/sam2/configs/sam2/sam2_hiera_l.yaml --sam2-checkpoint ../sam2-main/checkpoints/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode faithful --sam-imgsz 640 --sam-device cuda --guard-net-box-threshold 0.12 --guard-net-text-threshold 0.12 --guard-net-max-box-area-ratio 0.85 --guard-net-candidate-count 12 --guard-net-mask-output-mode continuous-band --guard-net-continuous-band-margin 4 --guard-net-continuous-band-endpoint-source all-mask --guard-net-save-selected-sam-mask true --max-analysis-frames 100 --visualization-max-frames 100
+
+  python -m src.pipeline.analyze_event --input-type video --video examples/SchoolFenceVideo/ --camera-id cam02 --rules configs/rules.image.yaml --output outputs/stead_guard_net_full_10 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights/yolo11l.pt --sam2-enabled true --sam2-config ../sam2-main/sam2/configs/sam2/sam2_hiera_l.yaml --sam2-checkpoint ../sam2-main/checkpoints/sam2_hiera_large.pt --sam2-scan-frames 30 --sam-temporal-mode fast --sam-sample-every 5 --sam-imgsz 640 --sam-device cuda --guard-net-box-threshold 0.12 --guard-net-text-threshold 0.12 --guard-net-max-box-area-ratio 0.85 --guard-net-candidate-count 12 --guard-net-mask-output-mode continuous-band --guard-net-continuous-band-margin 4 --guard-net-continuous-band-endpoint-source all-mask --guard-net-save-selected-sam-mask true --max-analysis-frames 100 --visualization-max-frames 100
+
+  python -m src.pipeline.analyze_event --input-type image --image examples\SchoolFence\Fence2.png --camera-id cam02 --rules configs\rules.image.yaml --output outputs\fence_seg_guard_net2 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights\yolo11l.pt --sam2-enabled true --sam2-config ..\sam2-main\sam2\configs\sam2\sam2_hiera_l.yaml --sam2-checkpoint ..\sam2-main\checkpoints\sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda --guard-net-box-threshold 0.12 --guard-net-text-threshold 0.12 --guard-net-max-box-area-ratio 0.85 --guard-net-candidate-count 12 --guard-net-mask-output-mode continuous-band --guard-net-continuous-band-margin 4 --guard-net-continuous-band-endpoint-source all-mask --guard-net-save-selected-sam-mask true
+
+  python -m src.pipeline.analyze_event --input-type image --image examples\SchoolFence --recursive --batch-limit 0 --camera-id cam02 --rules configs\rules.image.yaml --output outputs\SchoolFence --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights\yolo11l.pt --sam2-enabled true --sam2-config ..\sam2-main\sam2\configs\sam2\sam2_hiera_l.yaml --sam2-checkpoint ..\sam2-main\checkpoints\sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda --guard-net-box-threshold 0.12 --guard-net-text-threshold 0.12 --guard-net-max-box-area-ratio 1 --guard-net-candidate-count 12 --guard-net-mask-output-mode continuous-band --guard-net-continuous-band-margin 4 --guard-net-continuous-band-endpoint-source all-mask --guard-net-save-selected-sam-mask true
+
+  # STEAD guard-net batch video mode. Each video gets an output subdirectory, and outputs/stead_guard_net_batch/batch_summary.json summarizes the batch.
+  python -m src.pipeline.analyze_event --input-type video --video examples/SchoolFenceVideo/example --recursive --batch-limit 0 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/test2 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights/yolo11l.pt --sam-temporal-mode fast --sam-sample-every 15 --sam2-enabled true --sam2-config ../sam2-main/sam2/configs/sam2/sam2_hiera_l.yaml --sam2-checkpoint ../sam2-main/checkpoints/sam2_hiera_large.pt --sam2-scan-frames 100 --sam-imgsz 640 --sam-device cuda --guard-net-box-threshold 0.12 --guard-net-text-threshold 0.12 --guard-net-max-box-area-ratio 0.85 --guard-net-candidate-count 12 --guard-net-mask-output-mode continuous-band --guard-net-continuous-band-margin 4 --guard-net-continuous-band-endpoint-source all-mask --guard-net-save-selected-sam-mask true --max-analysis-frames 0 --visualization-max-frames 0
+
+  # GroundingDINO + SAM2 fence segmentation
+  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_raw_sam --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode sam --save-selected-sam-mask
+
+  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_endpoint_largest --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-margin 4 --continuous-band-endpoint-source largest-component --save-selected-sam-mask
+
+  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_endpoint_all_mask --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-margin 4 --continuous-band-endpoint-source all-mask --save-selected-sam-mask
+
+  python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg_endpoint_refit5 --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 1 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-margin 4 --continuous-band-endpoint-source all-mask --continuous-band-min-height-ratio 0.10 --continuous-band-max-height-ratio 0.26 --save-selected-sam-mask --selection-mode best
+
+  python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg_best_sam --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 1 --selection-mode best --sam-candidate-count 50 --mask-output-mode sam --save-selected-sam-mask
+
+  python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg_thick_band --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 1 --selection-mode best --sam-candidate-count 50 --mask-output-mode continuous-band --continuous-band-endpoint-source all-mask --continuous-band-margin 4 --continuous-band-min-height-ratio 0.18 --continuous-band-max-height-ratio 0.55 --save-selected-sam-mask
+
+  python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg_old_like --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 1 --selection-mode all --sam-candidate-count 50 --mask-output-mode sam --save-selected-sam-mask
 ```

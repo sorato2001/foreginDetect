@@ -22,8 +22,10 @@ from src.perception.sam_tracking_adapter import SAMTrackingAdapter, SAMTrackingC
 from src.perception.yolo_detector import YoloDetector
 from src.pipeline.analyze_event import (
     _configure_pipeline_logging,
+    _copy_batch_visualizations,
     _sam_tracking_mask_iou_rule,
     _sam_tracking_prompt_summary,
+    _sam_tracking_rule_source,
     logger,
 )
 from src.rules.rule_engine import RuleEngine
@@ -115,10 +117,25 @@ def run_image_pipeline(
     sam_object_model: str | None = None,
     sam_track_model: str | None = None,
     sam_track_labels: list[str] | None = None,
+    sam2_config: str | None = None,
+    sam2_checkpoint: str | None = None,
+    sam2_enabled: bool = True,
     sam_device: str = "cuda",
     sam_iou_threshold: float = 0.10,
     sam_object_overlap_threshold: float = 0.15,
     sam_imgsz: int = 640,
+    rule_region_source: str = "auto",
+    guard_net_requested: bool = False,
+    guard_net_text_prompt: str | None = None,
+    guard_net_box_threshold: float = 0.12,
+    guard_net_text_threshold: float = 0.12,
+    guard_net_max_box_area_ratio: float = 0.85,
+    guard_net_candidate_count: int = 12,
+    guard_net_crop_roi: str | None = None,
+    guard_net_mask_output_mode: str = "continuous-band",
+    guard_net_continuous_band_margin: int = 4,
+    guard_net_continuous_band_endpoint_source: str = "largest-component",
+    guard_net_save_selected_sam_mask: bool = False,
 ) -> dict[str, Any]:
     """Run STEAD analysis on a single image and write standard artifacts."""
     event_id = event_id or f"image_{uuid.uuid4().hex[:8]}"
@@ -147,19 +164,37 @@ def run_image_pipeline(
     logger.info("STEP 02 detector/tracker: begin image detection tracker=%s", tracker)
     sam_tracking_result: SAMTrackingResult | None = None
     if tracker == "sam_tracking" and not mock_detections:
+        from src.pipeline.analyze_event import _resolve_rule_region_source
+
+        resolved_rule_region_source = _resolve_rule_region_source(rule_region_source, tracker, sam_track_model, guard_net_requested)
         sam_config = SAMTrackingConfig(
             object_model_path=sam_object_model or SAMTrackingConfig().object_model_path,
             track_model_path=sam_track_model or SAMTrackingConfig().track_model_path,
+            rule_region_source=resolved_rule_region_source,
+            rule_region_source_requested=rule_region_source,
             track_mask_labels=sam_track_labels or [],
             device=sam_device,
             iou_threshold=sam_iou_threshold,
             object_overlap_threshold=sam_object_overlap_threshold,
             window_size=1,
             confirm_count=1,
-            sam2_enabled=False,
+            sam2_config=sam2_config,
+            sam2_checkpoint=sam2_checkpoint,
+            sam2_enabled=sam2_enabled,
             sample_every=1,
             track_mask_interval=1,
             imgsz=sam_imgsz,
+            output_dir=str(out),
+            guard_net_text_prompt=guard_net_text_prompt or SAMTrackingConfig().guard_net_text_prompt,
+            guard_net_box_threshold=guard_net_box_threshold,
+            guard_net_text_threshold=guard_net_text_threshold,
+            guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
+            guard_net_candidate_count=guard_net_candidate_count,
+            guard_net_crop_roi=guard_net_crop_roi,
+            guard_net_mask_output_mode=guard_net_mask_output_mode,
+            guard_net_continuous_band_margin=guard_net_continuous_band_margin,
+            guard_net_continuous_band_endpoint_source=guard_net_continuous_band_endpoint_source,
+            guard_net_save_selected_sam_mask=guard_net_save_selected_sam_mask,
         )
         sam_tracking_result = _detect_image_with_sam_tracking(image_path, sam_config)
         tracks = sam_tracking_result.tracks
@@ -206,13 +241,17 @@ def run_image_pipeline(
     sam_rule = _sam_tracking_mask_iou_rule(sam_tracking_result)
     if sam_rule is not None:
         evidence.roi_rules = [sam_rule]
-        evidence.metadata["rule_source"] = "sam_tracking_mask_iou"
-        logger.info("STEP 04 ROI/rules: using SAMTracking mask IoU rule because track mask is available")
+        evidence.metadata["rule_source"] = _sam_tracking_rule_source(sam_tracking_result)
+        logger.info(
+            "STEP 04 ROI/rules: using %s mask IoU rule because rule-region mask is available",
+            sam_tracking_result.metadata.get("rule_region_source_resolved"),
+        )
     else:
         evidence.roi_rules = rule_engine.evaluate(evidence)
         evidence.metadata["rule_source"] = "config_rules"
         if tracker == "sam_tracking":
-            logger.info("STEP 04 ROI/rules: SAMTracking track mask unavailable; fallback to config rules")
+            source = sam_tracking_result.metadata.get("rule_region_source_resolved") if sam_tracking_result else None
+            logger.info("STEP 04 ROI/rules: %s rule-region mask unavailable; fallback to config rules", source or "SAMTracking")
     triggered_rules = [rule.rule_id for rule in evidence.roi_rules if rule.triggered]
     logger.info(
         "STEP 04 ROI/rules: done rules=%s triggered=%s elapsed=%.3fs",
@@ -227,12 +266,24 @@ def run_image_pipeline(
     if sam_tracking_result is not None:
         sam_tracking_artifact = str(out / "sam_tracking_result.json")
         save_json(sam_tracking_result.to_json_dict(), sam_tracking_artifact)
+        guard_net_meta = sam_tracking_result.metadata.get("guard_net") or {}
+        if sam_tracking_result.metadata.get("rule_region_source_resolved") == "guard_net":
+            save_json(
+                {
+                    "source": "guard_net",
+                    "available": sam_tracking_result.metadata.get("rule_region_available"),
+                    "metadata": guard_net_meta,
+                },
+                str(out / "guard_net_region_result.json"),
+            )
         evidence.metadata["sam_tracking"] = {
             "artifact": sam_tracking_artifact,
             "degraded": sam_tracking_result.metadata.get("degraded"),
             "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
             "intrusion_events": len(sam_tracking_result.intrusion_events),
             "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
+            "rule_region_source": sam_tracking_result.metadata.get("rule_region_source_resolved"),
+            "rule_region_available": sam_tracking_result.metadata.get("rule_region_available"),
             "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
             "summary": _sam_tracking_prompt_summary(sam_tracking_result),
         }
@@ -343,10 +394,25 @@ def run_image_batch_pipeline(
     sam_object_model: str | None = None,
     sam_track_model: str | None = None,
     sam_track_labels: list[str] | None = None,
+    sam2_config: str | None = None,
+    sam2_checkpoint: str | None = None,
+    sam2_enabled: bool = True,
     sam_device: str = "cuda",
     sam_iou_threshold: float = 0.10,
     sam_object_overlap_threshold: float = 0.15,
     sam_imgsz: int = 640,
+    rule_region_source: str = "auto",
+    guard_net_requested: bool = False,
+    guard_net_text_prompt: str | None = None,
+    guard_net_box_threshold: float = 0.12,
+    guard_net_text_threshold: float = 0.12,
+    guard_net_max_box_area_ratio: float = 0.85,
+    guard_net_candidate_count: int = 12,
+    guard_net_crop_roi: str | None = None,
+    guard_net_mask_output_mode: str = "continuous-band",
+    guard_net_continuous_band_margin: int = 4,
+    guard_net_continuous_band_endpoint_source: str = "largest-component",
+    guard_net_save_selected_sam_mask: bool = False,
     recursive: bool = False,
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -356,6 +422,8 @@ def run_image_batch_pipeline(
     image_paths = collect_image_paths(source, recursive=recursive, limit=limit)
     results: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
+    batch_visualizations: list[dict[str, str]] = []
+    batch_vis_dir = out / "batch_visualizations"
 
     for index, item in enumerate(image_paths, start=1):
         item_output = _batch_item_dir(out, source, item)
@@ -382,12 +450,30 @@ def run_image_batch_pipeline(
                 sam_object_model=sam_object_model,
                 sam_track_model=sam_track_model,
                 sam_track_labels=sam_track_labels,
+                sam2_config=sam2_config,
+                sam2_checkpoint=sam2_checkpoint,
+                sam2_enabled=sam2_enabled,
                 sam_device=sam_device,
                 sam_iou_threshold=sam_iou_threshold,
                 sam_object_overlap_threshold=sam_object_overlap_threshold,
                 sam_imgsz=sam_imgsz,
+                rule_region_source=rule_region_source,
+                guard_net_requested=guard_net_requested,
+                guard_net_text_prompt=guard_net_text_prompt,
+                guard_net_box_threshold=guard_net_box_threshold,
+                guard_net_text_threshold=guard_net_text_threshold,
+                guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
+                guard_net_candidate_count=guard_net_candidate_count,
+                guard_net_crop_roi=guard_net_crop_roi,
+                guard_net_mask_output_mode=guard_net_mask_output_mode,
+                guard_net_continuous_band_margin=guard_net_continuous_band_margin,
+                guard_net_continuous_band_endpoint_source=guard_net_continuous_band_endpoint_source,
+                guard_net_save_selected_sam_mask=guard_net_save_selected_sam_mask,
             )
             result["source_image"] = str(item)
+            copied_visualizations = _copy_batch_visualizations(result, batch_vis_dir, f"{index:04d}_{item.stem}")
+            result["batch_visualizations"] = copied_visualizations
+            batch_visualizations.extend(copied_visualizations)
             results.append(result)
         except Exception as exc:
             logger.exception("Batch image analysis failed: image=%s", item)
@@ -402,6 +488,8 @@ def run_image_batch_pipeline(
         "succeeded": len(results),
         "failed": len(failures),
         "alarm_count": sum(1 for item in results if item.get("is_alarm")),
+        "batch_visualization_dir": str(batch_vis_dir),
+        "batch_visualizations": batch_visualizations,
         "results": results,
         "failures": failures,
     }

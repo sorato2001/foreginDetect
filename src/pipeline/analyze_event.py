@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from src.alarm.alarm_engine import AlarmEngine
 from src.config.settings import ensure_output_dir
@@ -27,6 +29,29 @@ from src.visualization.pipeline_visualizer import save_pipeline_visualization
 
 logger = logging.getLogger("stead.pipeline")
 
+VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".webm"}
+
+
+def _copy_batch_visualizations(result: dict[str, Any], batch_vis_dir: Path, prefix: str) -> list[dict[str, str]]:
+    """Copy per-item visualization artifacts into the batch output directory."""
+    visualization = result.get("visualization") if isinstance(result, dict) else None
+    if not isinstance(visualization, dict):
+        return []
+    artifact_names = ["annotated_image", "annotated_video", "overview_image", "evidence_animation"]
+    copied: list[dict[str, str]] = []
+    batch_vis_dir.mkdir(parents=True, exist_ok=True)
+    for artifact_name in artifact_names:
+        artifact_value = visualization.get(artifact_name)
+        if not artifact_value:
+            continue
+        src = Path(str(artifact_value))
+        if not src.exists() or not src.is_file():
+            continue
+        dst = batch_vis_dir / f"{prefix}_{artifact_name}{src.suffix}"
+        shutil.copy2(src, dst)
+        copied.append({"artifact": artifact_name, "source": str(src), "copy": str(dst)})
+    return copied
+
 
 def _parse_bool(value: str | bool) -> bool:
     """Parse CLI boolean values."""
@@ -40,6 +65,56 @@ def _parse_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _guard_net_args_used(args: argparse.Namespace) -> bool:
+    """Return true when the user supplied guard-net-specific CLI options."""
+    for name, default in {
+        "guard_net_text_prompt": SAMTrackingConfig().guard_net_text_prompt,
+        "guard_net_box_threshold": 0.12,
+        "guard_net_text_threshold": 0.12,
+        "guard_net_max_box_area_ratio": 0.85,
+        "guard_net_candidate_count": 12,
+        "guard_net_crop_roi": None,
+        "guard_net_mask_output_mode": "continuous-band",
+        "guard_net_continuous_band_margin": 4,
+        "guard_net_continuous_band_endpoint_source": "largest-component",
+        "guard_net_save_selected_sam_mask": "false",
+    }.items():
+        if getattr(args, name, default) != default:
+            return True
+    return False
+
+
+def _validate_rule_region_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Fail fast for rule-region source combinations that cannot work."""
+    source = args.rule_region_source
+    if args.tracker != "sam_tracking" and source in {"sam_track", "guard_net"}:
+        parser.error(f"rule-region-source={source} requires --tracker sam_tracking.")
+    if args.tracker != "sam_tracking" and source == "auto" and _guard_net_args_used(args):
+        parser.error("guard-net options require --tracker sam_tracking.")
+    if source == "sam_track" and not args.sam_track_model:
+        parser.error("rule-region-source=sam_track requires --sam-track-model.")
+    if source == "sam_track" and _guard_net_args_used(args):
+        parser.error("guard-net options require --rule-region-source guard_net or auto.")
+    if source == "guard_net" and args.sam_track_model:
+        parser.error("rule-region-source=guard_net does not use --sam-track-model; remove it or use --rule-region-source sam_track.")
+    if source == "yaml" and args.tracker == "simple_iou":
+        return
+
+
+def _resolve_rule_region_source(requested: str, tracker: str, sam_track_model: str | None, guard_net_requested: bool = False) -> str:
+    """Resolve auto/yaml/sam_track/guard_net into the source used by SAMTracking."""
+    requested = (requested or "auto").strip().lower()
+    if tracker != "sam_tracking":
+        return "yaml"
+    if requested != "auto":
+        return requested
+    if guard_net_requested:
+        return "guard_net"
+    if sam_track_model:
+        return "sam_track"
+    return "yaml"
 
 
 def _fake_tracks() -> dict[int, list[Detection]]:
@@ -131,6 +206,33 @@ def _detect_video_with_sam_tracking(
     return adapter.analyze_video(video_path, max_frames=max_analysis_frames)
 
 
+def collect_video_paths(video_path: str | Path, recursive: bool = False, limit: int | None = None) -> list[Path]:
+    """Collect one video path or all supported videos in a directory."""
+    root = Path(video_path)
+    if root.is_file():
+        return [root] if root.suffix.lower() in VIDEO_SUFFIXES else []
+    if not root.is_dir():
+        return []
+    candidates = root.rglob("*") if recursive else root.iterdir()
+    paths = sorted(path for path in candidates if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES)
+    if limit is not None and limit > 0:
+        return paths[:limit]
+    return paths
+
+
+def _batch_video_item_dir(output_dir: Path, source_root: Path, video_path: Path) -> Path:
+    """Return a stable per-video output directory."""
+    if source_root.is_dir():
+        try:
+            relative = video_path.relative_to(source_root).with_suffix("")
+        except ValueError:
+            relative = Path(video_path.stem)
+    else:
+        relative = Path(video_path.stem)
+    safe_parts = [part.replace(" ", "_") for part in relative.parts]
+    return output_dir.joinpath(*safe_parts)
+
+
 def run_pipeline(
     video_path: str,
     camera_id: str,
@@ -170,6 +272,18 @@ def run_pipeline(
     sam_track_mask_interval: int = 30,
     sam_imgsz: int = 640,
     sam_progress_interval: int = 10,
+    rule_region_source: str = "auto",
+    guard_net_requested: bool = False,
+    guard_net_text_prompt: str | None = None,
+    guard_net_box_threshold: float = 0.12,
+    guard_net_text_threshold: float = 0.12,
+    guard_net_max_box_area_ratio: float = 0.85,
+    guard_net_candidate_count: int = 12,
+    guard_net_crop_roi: str | None = None,
+    guard_net_mask_output_mode: str = "continuous-band",
+    guard_net_continuous_band_margin: int = 4,
+    guard_net_continuous_band_endpoint_source: str = "largest-component",
+    guard_net_save_selected_sam_mask: bool = False,
 ) -> dict:
     """Run STEAD event analysis and write JSON artifacts."""
     event_id = event_id or f"event_{uuid.uuid4().hex[:8]}"
@@ -186,10 +300,13 @@ def run_pipeline(
         effective_vlm_provider,
         vlm_mode,
     )
+    resolved_rule_region_source = _resolve_rule_region_source(rule_region_source, tracker, sam_track_model, guard_net_requested)
     logger.info(
-        "STEP 01 config: rules=%s tracker=%s mock_detections=%s max_analysis_frames=%s save_visualization=%s visualization_max_frames=%s",
+        "STEP 01 config: rules=%s tracker=%s rule_region_source=%s resolved_rule_region_source=%s mock_detections=%s max_analysis_frames=%s save_visualization=%s visualization_max_frames=%s",
         rules_path,
         tracker,
+        rule_region_source,
+        resolved_rule_region_source,
         mock_detections,
         max_analysis_frames,
         save_visualization,
@@ -203,6 +320,8 @@ def run_pipeline(
         sam_config = SAMTrackingConfig(
             object_model_path=sam_object_model or SAMTrackingConfig().object_model_path,
             track_model_path=sam_track_model or SAMTrackingConfig().track_model_path,
+            rule_region_source=resolved_rule_region_source,
+            rule_region_source_requested=rule_region_source,
             track_mask_labels=sam_track_labels or [],
             sam2_config=sam2_config,
             sam2_checkpoint=sam2_checkpoint,
@@ -220,6 +339,17 @@ def run_pipeline(
             track_mask_interval=sam_track_mask_interval,
             imgsz=sam_imgsz,
             progress_interval=sam_progress_interval,
+            output_dir=str(out),
+            guard_net_text_prompt=guard_net_text_prompt or SAMTrackingConfig().guard_net_text_prompt,
+            guard_net_box_threshold=guard_net_box_threshold,
+            guard_net_text_threshold=guard_net_text_threshold,
+            guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
+            guard_net_candidate_count=guard_net_candidate_count,
+            guard_net_crop_roi=guard_net_crop_roi,
+            guard_net_mask_output_mode=guard_net_mask_output_mode,
+            guard_net_continuous_band_margin=guard_net_continuous_band_margin,
+            guard_net_continuous_band_endpoint_source=guard_net_continuous_band_endpoint_source,
+            guard_net_save_selected_sam_mask=guard_net_save_selected_sam_mask,
         )
         sam_tracking_result = _detect_video_with_sam_tracking(
             video_path,
@@ -258,13 +388,17 @@ def run_pipeline(
     sam_rule = _sam_tracking_mask_iou_rule(sam_tracking_result)
     if sam_rule is not None:
         evidence.roi_rules = [sam_rule]
-        evidence.metadata["rule_source"] = "sam_tracking_mask_iou"
-        logger.info("STEP 04 ROI/rules: using SAMTracking mask IoU rule because track mask is available")
+        evidence.metadata["rule_source"] = _sam_tracking_rule_source(sam_tracking_result)
+        logger.info(
+            "STEP 04 ROI/rules: using %s mask IoU rule because rule-region mask is available",
+            sam_tracking_result.metadata.get("rule_region_source_resolved"),
+        )
     else:
         evidence.roi_rules = rule_engine.evaluate(evidence)
         evidence.metadata["rule_source"] = "config_rules"
         if tracker == "sam_tracking":
-            logger.info("STEP 04 ROI/rules: SAMTracking track mask unavailable; fallback to config rules")
+            source = sam_tracking_result.metadata.get("rule_region_source_resolved") if sam_tracking_result else None
+            logger.info("STEP 04 ROI/rules: %s rule-region mask unavailable; fallback to config rules", source or "SAMTracking")
     triggered_rules = [rule.rule_id for rule in evidence.roi_rules if rule.triggered]
     logger.info(
         "STEP 04 ROI/rules: done rules=%s triggered=%s elapsed=%.3fs",
@@ -281,12 +415,24 @@ def run_pipeline(
     if sam_tracking_result is not None:
         sam_tracking_artifact = str(out / "sam_tracking_result.json")
         save_json(sam_tracking_result.to_json_dict(), sam_tracking_artifact)
+        guard_net_meta = sam_tracking_result.metadata.get("guard_net") or {}
+        if sam_tracking_result.metadata.get("rule_region_source_resolved") == "guard_net":
+            save_json(
+                {
+                    "source": "guard_net",
+                    "available": sam_tracking_result.metadata.get("rule_region_available"),
+                    "metadata": guard_net_meta,
+                },
+                str(out / "guard_net_region_result.json"),
+            )
         evidence.metadata["sam_tracking"] = {
             "artifact": sam_tracking_artifact,
             "degraded": sam_tracking_result.metadata.get("degraded"),
             "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
             "intrusion_events": len(sam_tracking_result.intrusion_events),
             "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
+            "rule_region_source": sam_tracking_result.metadata.get("rule_region_source_resolved"),
+            "rule_region_available": sam_tracking_result.metadata.get("rule_region_available"),
             "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
             "summary": _sam_tracking_prompt_summary(sam_tracking_result),
         }
@@ -391,10 +537,158 @@ def run_pipeline(
     }
 
 
+def run_video_batch_pipeline(
+    video_path: str,
+    camera_id: str,
+    rules_path: str,
+    output_dir: str,
+    vlm_provider: str = "mock",
+    vlm_mode: str = "web",
+    vlm_local_endpoint: str = "http://localhost:8082/v1/chat/completions",
+    vlm_local_model: str = "gemma-4-26B",
+    vlm_local_max_images: int = 1,
+    mock_detections: bool = False,
+    vlm_timeout: float = 20.0,
+    vlm_max_retries: int = 0,
+    vlm_fallback_on_error: bool = True,
+    save_visualization: bool = True,
+    max_analysis_frames: int | None = 900,
+    visualization_max_frames: int | None = 300,
+    log_level: str = "INFO",
+    tracker: str = "simple_iou",
+    sam_object_model: str | None = None,
+    sam_track_model: str | None = None,
+    sam_track_labels: list[str] | None = None,
+    sam2_config: str | None = None,
+    sam2_checkpoint: str | None = None,
+    sam_device: str = "cuda",
+    sam_iou_threshold: float = 0.10,
+    sam_object_overlap_threshold: float = 0.15,
+    sam_window_size: int = 5,
+    sam_confirm_count: int = 3,
+    sam_use_optical_flow: bool = True,
+    sam2_enabled: bool = True,
+    sam2_scan_frames: int = 30,
+    sam2_prompt_mode: str = "bounding_box",
+    sam_temporal_mode: str = "fast",
+    sam_sample_every: int = 15,
+    sam_track_mask_interval: int = 30,
+    sam_imgsz: int = 640,
+    sam_progress_interval: int = 10,
+    rule_region_source: str = "auto",
+    guard_net_requested: bool = False,
+    guard_net_text_prompt: str | None = None,
+    guard_net_box_threshold: float = 0.12,
+    guard_net_text_threshold: float = 0.12,
+    guard_net_max_box_area_ratio: float = 0.85,
+    guard_net_candidate_count: int = 12,
+    guard_net_crop_roi: str | None = None,
+    guard_net_mask_output_mode: str = "continuous-band",
+    guard_net_continuous_band_margin: int = 4,
+    guard_net_continuous_band_endpoint_source: str = "largest-component",
+    guard_net_save_selected_sam_mask: bool = False,
+    recursive: bool = False,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Run video analysis for a file or directory and write a batch summary."""
+    source = Path(video_path)
+    out = ensure_output_dir(output_dir)
+    video_paths = collect_video_paths(source, recursive=recursive, limit=limit)
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    batch_visualizations: list[dict[str, str]] = []
+    batch_vis_dir = out / "batch_visualizations"
+
+    for index, item in enumerate(video_paths, start=1):
+        item_output = _batch_video_item_dir(out, source, item)
+        event_id = f"video_{item.stem}_{index:04d}"
+        try:
+            result = run_pipeline(
+                video_path=str(item),
+                camera_id=camera_id,
+                rules_path=rules_path,
+                output_dir=str(item_output),
+                vlm_provider=vlm_provider,
+                vlm_mode=vlm_mode,
+                vlm_local_endpoint=vlm_local_endpoint,
+                vlm_local_model=vlm_local_model,
+                vlm_local_max_images=vlm_local_max_images,
+                event_id=event_id,
+                mock_detections=mock_detections,
+                vlm_timeout=vlm_timeout,
+                vlm_max_retries=vlm_max_retries,
+                vlm_fallback_on_error=vlm_fallback_on_error,
+                save_visualization=save_visualization,
+                max_analysis_frames=max_analysis_frames,
+                visualization_max_frames=visualization_max_frames,
+                log_level=log_level,
+                tracker=tracker,
+                sam_object_model=sam_object_model,
+                sam_track_model=sam_track_model,
+                sam_track_labels=sam_track_labels,
+                sam2_config=sam2_config,
+                sam2_checkpoint=sam2_checkpoint,
+                sam_device=sam_device,
+                sam_iou_threshold=sam_iou_threshold,
+                sam_object_overlap_threshold=sam_object_overlap_threshold,
+                sam_window_size=sam_window_size,
+                sam_confirm_count=sam_confirm_count,
+                sam_use_optical_flow=sam_use_optical_flow,
+                sam2_enabled=sam2_enabled,
+                sam2_scan_frames=sam2_scan_frames,
+                sam2_prompt_mode=sam2_prompt_mode,
+                sam_temporal_mode=sam_temporal_mode,
+                sam_sample_every=sam_sample_every,
+                sam_track_mask_interval=sam_track_mask_interval,
+                sam_imgsz=sam_imgsz,
+                sam_progress_interval=sam_progress_interval,
+                rule_region_source=rule_region_source,
+                guard_net_requested=guard_net_requested,
+                guard_net_text_prompt=guard_net_text_prompt,
+                guard_net_box_threshold=guard_net_box_threshold,
+                guard_net_text_threshold=guard_net_text_threshold,
+                guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
+                guard_net_candidate_count=guard_net_candidate_count,
+                guard_net_crop_roi=guard_net_crop_roi,
+                guard_net_mask_output_mode=guard_net_mask_output_mode,
+                guard_net_continuous_band_margin=guard_net_continuous_band_margin,
+                guard_net_continuous_band_endpoint_source=guard_net_continuous_band_endpoint_source,
+                guard_net_save_selected_sam_mask=guard_net_save_selected_sam_mask,
+            )
+            result["source_video"] = str(item)
+            copied_visualizations = _copy_batch_visualizations(result, batch_vis_dir, f"{index:04d}_{item.stem}")
+            result["batch_visualizations"] = copied_visualizations
+            batch_visualizations.extend(copied_visualizations)
+            results.append(result)
+        except Exception as exc:
+            logger.exception("Batch video analysis failed: video=%s", item)
+            failures.append({"video": str(item), "error_type": type(exc).__name__, "error_message": str(exc)[:500]})
+
+    summary = {
+        "input_type": "video_batch",
+        "source": str(source),
+        "output_dir": str(out),
+        "recursive": recursive,
+        "total": len(video_paths),
+        "succeeded": len(results),
+        "failed": len(failures),
+        "alarm_count": sum(1 for item in results if item.get("is_alarm")),
+        "batch_visualization_dir": str(batch_vis_dir),
+        "batch_visualizations": batch_visualizations,
+        "results": results,
+        "failures": failures,
+    }
+    summary_path = out / "batch_summary.json"
+    save_json(summary, str(summary_path))
+    summary["summary_json"] = str(summary_path)
+    return summary
+
+
 def _sam_tracking_mask_iou_rule(sam_tracking_result: SAMTrackingResult | None) -> ROIRuleTrigger | None:
     """Build a STEP 04 rule result from SAMTracking mask-IoU intrusion judgment."""
     if sam_tracking_result is None or not _sam_tracking_has_track_mask(sam_tracking_result):
         return None
+    source = sam_tracking_result.metadata.get("rule_region_source_resolved") or "sam_track"
     alarm_frames = [frame for frame in sam_tracking_result.frames if frame.alarm]
     suspicious_frames = [frame for frame in sam_tracking_result.frames if frame.suspicious]
     evidence_tracks = sorted(
@@ -411,10 +705,12 @@ def _sam_tracking_mask_iou_rule(sam_tracking_result: SAMTrackingResult | None) -
     trigger_time = [trigger_frames[0].timestamp, trigger_frames[-1].timestamp] if trigger_frames else None
     peak_iou = max((frame.max_iou for frame in sam_tracking_result.frames), default=0.0)
     severity = "high" if alarm_frames else "medium" if suspicious_frames else "none"
+    rule_id = "guard_net_mask_iou_intrusion" if source == "guard_net" else "sam_track_mask_iou_intrusion"
+    roi_id = "guard_net_rule_region" if source == "guard_net" else "sam_track_rule_region"
     return ROIRuleTrigger(
-        rule_id="sam_mask_iou_intrusion",
+        rule_id=rule_id,
         rule_type="mask_iou_intrusion",
-        roi_id="segmented_railway_track",
+        roi_id=roi_id,
         triggered=triggered,
         trigger_time=trigger_time,
         evidence_tracks=evidence_tracks,
@@ -422,8 +718,22 @@ def _sam_tracking_mask_iou_rule(sam_tracking_result: SAMTrackingResult | None) -
     )
 
 
+def _sam_tracking_rule_source(sam_tracking_result: SAMTrackingResult | None) -> str:
+    """Return a display-safe rule source for segmentation mask IoU rules."""
+    if sam_tracking_result is None:
+        return "sam_tracking_mask_iou"
+    source = sam_tracking_result.metadata.get("rule_region_source_resolved")
+    if source == "guard_net":
+        return "guard_net_mask_iou"
+    if source == "sam_track":
+        return "sam_track_mask_iou"
+    return "sam_tracking_mask_iou"
+
+
 def _sam_tracking_has_track_mask(sam_tracking_result: SAMTrackingResult) -> bool:
     """Return true only when SAMTracking produced an actual railway/track mask."""
+    if sam_tracking_result.metadata.get("rule_region_source_resolved") == "yaml":
+        return False
     if not sam_tracking_result.metadata.get("track_mask_seen"):
         return False
     return any(frame.track_mask_available for frame in sam_tracking_result.frames)
@@ -438,7 +748,14 @@ def _sam_tracking_prompt_summary(sam_tracking_result: SAMTrackingResult) -> dict
     sample_frames = alarms[:3] or suspicious[:3] or ([peak] if peak is not None else [])
     return {
         "rule_type": "mask_iou_intrusion",
+        "rule_region_source": sam_tracking_result.metadata.get("rule_region_source_resolved"),
+        "rule_region_type": "continuous_guard_net_band"
+        if sam_tracking_result.metadata.get("rule_region_source_resolved") == "guard_net"
+        else "segmentation_mask",
+        "intrusion_judgment": "mask_iou_and_object_overlap",
         "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
+        "fallback_used": bool((sam_tracking_result.metadata.get("guard_net") or {}).get("fallback_reason")),
+        "fallback_reason": (sam_tracking_result.metadata.get("guard_net") or {}).get("fallback_reason"),
         "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
         "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
         "sample_every": sam_tracking_result.metadata.get("sample_every"),
@@ -482,9 +799,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze one surveillance event with STEAD.")
     parser.add_argument("--input-type", choices=["video", "image"], default="video")
     parser.add_argument("--video", default=None)
+    parser.add_argument("--video-dir", default=None, help="Directory of videos for batch video analysis")
     parser.add_argument("--image", default=None)
-    parser.add_argument("--recursive", action="store_true", help="For image input directories, scan subdirectories")
-    parser.add_argument("--batch-limit", type=int, default=0, help="For image input directories, limit number of images; 0 means no limit")
+    parser.add_argument("--recursive", action="store_true", help="For input directories, scan subdirectories")
+    parser.add_argument("--batch-limit", type=int, default=0, help="For input directories, limit number of files; 0 means no limit")
     parser.add_argument("--camera-id", required=True)
     parser.add_argument("--rules", default="configs/rules.example.yaml")
     parser.add_argument("--output", required=True)
@@ -503,6 +821,7 @@ def main() -> int:
     parser.add_argument("--visualization-max-frames", type=int, default=300, help="Max annotated-video frames; 0 means full video")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--tracker", "--track", dest="tracker", choices=["simple_iou", "sam_tracking"], default="simple_iou")
+    parser.add_argument("--rule-region-source", choices=["yaml", "sam_track", "guard_net", "auto"], default="auto")
     parser.add_argument("--sam-object-model", default=None, help="YOLO11 object model path for SAMTracking")
     parser.add_argument("--sam-track-model", default=None, help="Rail/track segmentation best.pt path for SAMTracking")
     parser.add_argument("--sam-track-labels", default=None, help="Comma-separated segmentation labels to merge as railway/track mask")
@@ -522,11 +841,23 @@ def main() -> int:
     parser.add_argument("--sam-track-mask-interval", type=int, default=30, help="Run railway mask segmentation every N frames in SAMTracking")
     parser.add_argument("--sam-imgsz", type=int, default=640, help="YOLO inference image size for SAMTracking")
     parser.add_argument("--sam-progress-interval", type=int, default=10, help="Log SAMTracking progress every N processed frames")
+    parser.add_argument("--guard-net-text-prompt", default=SAMTrackingConfig().guard_net_text_prompt)
+    parser.add_argument("--guard-net-box-threshold", type=float, default=0.12)
+    parser.add_argument("--guard-net-text-threshold", type=float, default=0.12)
+    parser.add_argument("--guard-net-max-box-area-ratio", type=float, default=0.85)
+    parser.add_argument("--guard-net-candidate-count", type=int, default=12)
+    parser.add_argument("--guard-net-crop-roi", default=None)
+    parser.add_argument("--guard-net-mask-output-mode", choices=["sam", "continuous-band"], default="continuous-band")
+    parser.add_argument("--guard-net-continuous-band-margin", type=int, default=4)
+    parser.add_argument("--guard-net-continuous-band-endpoint-source", choices=["largest-component", "all-mask"], default="largest-component")
+    parser.add_argument("--guard-net-save-selected-sam-mask", default="false")
     args = parser.parse_args()
     try:
         resolve_vlm_provider(args.vlm_provider, args.vlm_mode)
     except ValueError as exc:
         parser.error(str(exc))
+    _validate_rule_region_args(parser, args)
+    guard_net_requested = _guard_net_args_used(args)
     if args.input_type == "image":
         if not args.image:
             parser.error("--image is required when --input-type image")
@@ -554,10 +885,25 @@ def main() -> int:
                 sam_object_model=args.sam_object_model,
                 sam_track_model=args.sam_track_model,
                 sam_track_labels=_parse_csv(args.sam_track_labels),
+                sam2_config=args.sam2_config,
+                sam2_checkpoint=args.sam2_checkpoint,
+                sam2_enabled=_parse_bool(args.sam2_enabled),
                 sam_device=args.sam_device,
                 sam_iou_threshold=args.sam_iou_threshold,
                 sam_object_overlap_threshold=args.sam_object_overlap_threshold,
                 sam_imgsz=args.sam_imgsz,
+                rule_region_source=args.rule_region_source,
+                guard_net_requested=guard_net_requested,
+                guard_net_text_prompt=args.guard_net_text_prompt,
+                guard_net_box_threshold=args.guard_net_box_threshold,
+                guard_net_text_threshold=args.guard_net_text_threshold,
+                guard_net_max_box_area_ratio=args.guard_net_max_box_area_ratio,
+                guard_net_candidate_count=args.guard_net_candidate_count,
+                guard_net_crop_roi=args.guard_net_crop_roi,
+                guard_net_mask_output_mode=args.guard_net_mask_output_mode,
+                guard_net_continuous_band_margin=args.guard_net_continuous_band_margin,
+                guard_net_continuous_band_endpoint_source=args.guard_net_continuous_band_endpoint_source,
+                guard_net_save_selected_sam_mask=_parse_bool(args.guard_net_save_selected_sam_mask),
                 recursive=args.recursive,
                 limit=args.batch_limit or None,
             )
@@ -585,54 +931,138 @@ def main() -> int:
                 sam_object_model=args.sam_object_model,
                 sam_track_model=args.sam_track_model,
                 sam_track_labels=_parse_csv(args.sam_track_labels),
+                sam2_config=args.sam2_config,
+                sam2_checkpoint=args.sam2_checkpoint,
+                sam2_enabled=_parse_bool(args.sam2_enabled),
                 sam_device=args.sam_device,
                 sam_iou_threshold=args.sam_iou_threshold,
                 sam_object_overlap_threshold=args.sam_object_overlap_threshold,
                 sam_imgsz=args.sam_imgsz,
+                rule_region_source=args.rule_region_source,
+                guard_net_requested=guard_net_requested,
+                guard_net_text_prompt=args.guard_net_text_prompt,
+                guard_net_box_threshold=args.guard_net_box_threshold,
+                guard_net_text_threshold=args.guard_net_text_threshold,
+                guard_net_max_box_area_ratio=args.guard_net_max_box_area_ratio,
+                guard_net_candidate_count=args.guard_net_candidate_count,
+                guard_net_crop_roi=args.guard_net_crop_roi,
+                guard_net_mask_output_mode=args.guard_net_mask_output_mode,
+                guard_net_continuous_band_margin=args.guard_net_continuous_band_margin,
+                guard_net_continuous_band_endpoint_source=args.guard_net_continuous_band_endpoint_source,
+                guard_net_save_selected_sam_mask=_parse_bool(args.guard_net_save_selected_sam_mask),
             )
     else:
-        if not args.video:
-            parser.error("--video is required when --input-type video")
-        result = run_pipeline(
-            video_path=args.video,
-            camera_id=args.camera_id,
-            rules_path=args.rules,
-            output_dir=args.output,
-            vlm_provider=args.vlm_provider,
-            vlm_mode=args.vlm_mode,
-            vlm_local_endpoint=args.vlm_local_endpoint,
-            vlm_local_model=args.vlm_local_model,
-            vlm_local_max_images=args.vlm_local_max_images,
-            event_id=args.event_id,
-            mock_detections=args.mock_detections,
-            vlm_timeout=args.vlm_timeout,
-            vlm_max_retries=args.vlm_max_retries,
-            vlm_fallback_on_error=_parse_bool(args.vlm_fallback_on_error),
-            save_visualization=not args.no_visualization,
-            max_analysis_frames=args.max_analysis_frames or None,
-            visualization_max_frames=args.visualization_max_frames or None,
-            log_level=args.log_level,
-            tracker=args.tracker,
-            sam_object_model=args.sam_object_model,
-            sam_track_model=args.sam_track_model,
-            sam_track_labels=_parse_csv(args.sam_track_labels),
-            sam2_config=args.sam2_config,
-            sam2_checkpoint=args.sam2_checkpoint,
-            sam_device=args.sam_device,
-            sam_iou_threshold=args.sam_iou_threshold,
-            sam_object_overlap_threshold=args.sam_object_overlap_threshold,
-            sam_window_size=args.sam_window_size,
-            sam_confirm_count=args.sam_confirm_count,
-            sam_use_optical_flow=_parse_bool(args.sam_use_optical_flow),
-            sam2_enabled=_parse_bool(args.sam2_enabled),
-            sam2_scan_frames=args.sam2_scan_frames,
-            sam2_prompt_mode=args.sam2_prompt_mode,
-            sam_temporal_mode=args.sam_temporal_mode,
-            sam_sample_every=args.sam_sample_every,
-            sam_track_mask_interval=args.sam_track_mask_interval,
-            sam_imgsz=args.sam_imgsz,
-            sam_progress_interval=args.sam_progress_interval,
-        )
+        video_source_arg = args.video_dir or args.video
+        if not video_source_arg:
+            parser.error("--video or --video-dir is required when --input-type video")
+        video_source = Path(video_source_arg)
+        if video_source.is_dir():
+            result = run_video_batch_pipeline(
+                video_path=video_source_arg,
+                camera_id=args.camera_id,
+                rules_path=args.rules,
+                output_dir=args.output,
+                vlm_provider=args.vlm_provider,
+                vlm_mode=args.vlm_mode,
+                vlm_local_endpoint=args.vlm_local_endpoint,
+                vlm_local_model=args.vlm_local_model,
+                vlm_local_max_images=args.vlm_local_max_images,
+                mock_detections=args.mock_detections,
+                vlm_timeout=args.vlm_timeout,
+                vlm_max_retries=args.vlm_max_retries,
+                vlm_fallback_on_error=_parse_bool(args.vlm_fallback_on_error),
+                save_visualization=not args.no_visualization,
+                max_analysis_frames=args.max_analysis_frames or None,
+                visualization_max_frames=args.visualization_max_frames or None,
+                log_level=args.log_level,
+                tracker=args.tracker,
+                sam_object_model=args.sam_object_model,
+                sam_track_model=args.sam_track_model,
+                sam_track_labels=_parse_csv(args.sam_track_labels),
+                sam2_config=args.sam2_config,
+                sam2_checkpoint=args.sam2_checkpoint,
+                sam_device=args.sam_device,
+                sam_iou_threshold=args.sam_iou_threshold,
+                sam_object_overlap_threshold=args.sam_object_overlap_threshold,
+                sam_window_size=args.sam_window_size,
+                sam_confirm_count=args.sam_confirm_count,
+                sam_use_optical_flow=_parse_bool(args.sam_use_optical_flow),
+                sam2_enabled=_parse_bool(args.sam2_enabled),
+                sam2_scan_frames=args.sam2_scan_frames,
+                sam2_prompt_mode=args.sam2_prompt_mode,
+                sam_temporal_mode=args.sam_temporal_mode,
+                sam_sample_every=args.sam_sample_every,
+                sam_track_mask_interval=args.sam_track_mask_interval,
+                sam_imgsz=args.sam_imgsz,
+                sam_progress_interval=args.sam_progress_interval,
+                rule_region_source=args.rule_region_source,
+                guard_net_requested=guard_net_requested,
+                guard_net_text_prompt=args.guard_net_text_prompt,
+                guard_net_box_threshold=args.guard_net_box_threshold,
+                guard_net_text_threshold=args.guard_net_text_threshold,
+                guard_net_max_box_area_ratio=args.guard_net_max_box_area_ratio,
+                guard_net_candidate_count=args.guard_net_candidate_count,
+                guard_net_crop_roi=args.guard_net_crop_roi,
+                guard_net_mask_output_mode=args.guard_net_mask_output_mode,
+                guard_net_continuous_band_margin=args.guard_net_continuous_band_margin,
+                guard_net_continuous_band_endpoint_source=args.guard_net_continuous_band_endpoint_source,
+                guard_net_save_selected_sam_mask=_parse_bool(args.guard_net_save_selected_sam_mask),
+                recursive=args.recursive,
+                limit=args.batch_limit or None,
+            )
+        else:
+            result = run_pipeline(
+                video_path=video_source_arg,
+                camera_id=args.camera_id,
+                rules_path=args.rules,
+                output_dir=args.output,
+                vlm_provider=args.vlm_provider,
+                vlm_mode=args.vlm_mode,
+                vlm_local_endpoint=args.vlm_local_endpoint,
+                vlm_local_model=args.vlm_local_model,
+                vlm_local_max_images=args.vlm_local_max_images,
+                event_id=args.event_id,
+                mock_detections=args.mock_detections,
+                vlm_timeout=args.vlm_timeout,
+                vlm_max_retries=args.vlm_max_retries,
+                vlm_fallback_on_error=_parse_bool(args.vlm_fallback_on_error),
+                save_visualization=not args.no_visualization,
+                max_analysis_frames=args.max_analysis_frames or None,
+                visualization_max_frames=args.visualization_max_frames or None,
+                log_level=args.log_level,
+                tracker=args.tracker,
+                sam_object_model=args.sam_object_model,
+                sam_track_model=args.sam_track_model,
+                sam_track_labels=_parse_csv(args.sam_track_labels),
+                sam2_config=args.sam2_config,
+                sam2_checkpoint=args.sam2_checkpoint,
+                sam_device=args.sam_device,
+                sam_iou_threshold=args.sam_iou_threshold,
+                sam_object_overlap_threshold=args.sam_object_overlap_threshold,
+                sam_window_size=args.sam_window_size,
+                sam_confirm_count=args.sam_confirm_count,
+                sam_use_optical_flow=_parse_bool(args.sam_use_optical_flow),
+                sam2_enabled=_parse_bool(args.sam2_enabled),
+                sam2_scan_frames=args.sam2_scan_frames,
+                sam2_prompt_mode=args.sam2_prompt_mode,
+                sam_temporal_mode=args.sam_temporal_mode,
+                sam_sample_every=args.sam_sample_every,
+                sam_track_mask_interval=args.sam_track_mask_interval,
+                sam_imgsz=args.sam_imgsz,
+                sam_progress_interval=args.sam_progress_interval,
+                rule_region_source=args.rule_region_source,
+                guard_net_requested=guard_net_requested,
+                guard_net_text_prompt=args.guard_net_text_prompt,
+                guard_net_box_threshold=args.guard_net_box_threshold,
+                guard_net_text_threshold=args.guard_net_text_threshold,
+                guard_net_max_box_area_ratio=args.guard_net_max_box_area_ratio,
+                guard_net_candidate_count=args.guard_net_candidate_count,
+                guard_net_crop_roi=args.guard_net_crop_roi,
+                guard_net_mask_output_mode=args.guard_net_mask_output_mode,
+                guard_net_continuous_band_margin=args.guard_net_continuous_band_margin,
+                guard_net_continuous_band_endpoint_source=args.guard_net_continuous_band_endpoint_source,
+                guard_net_save_selected_sam_mask=_parse_bool(args.guard_net_save_selected_sam_mask),
+            )
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
