@@ -165,7 +165,7 @@ GroundingDINO is used by the optional guard-net/fence open-vocabulary
 segmentation script:
 
 ```text
-../GroundingDINO/fence_grounded_sam.py
+../GroundingDINO/fence_grounded_sam_1.py
 ```
 
 Install GroundingDINO into the same `multi_camera_event_system` virtual
@@ -213,51 +213,36 @@ Run the guard-net/fence segmentation demo:
 
 ```bash
 cd ../../GroundingDINO
-python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg --text-prompt "black chain link fence mesh wires. black metal mesh fence posts. continuous wire guard net. protective wire mesh barrier. fence panels." --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85
+python fence_grounded_sam_1.py --image weights/Fence.png --output outputs/fence_seg --text-prompt "entire continuous black metal chain link fence" --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 0.6
 ```
 
 With ROI:
 
 ```bash
-python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg --crop-roi 0,200,1920,1000 --text-prompt "black chain link fence mesh wires. black metal mesh fence posts. continuous wire guard net. protective wire mesh barrier. fence panels." --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85
+python fence_grounded_sam_1.py --image weights/Fence.png --output outputs/fence_seg --crop-roi 0,200,1920,1000 --text-prompt "entire continuous black metal chain link fence" --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 0.6
 ```
 
-By default, `fence_grounded_sam.py` uses `--selection-mode best`, so
+By default, `fence_grounded_sam_1.py` uses `--selection-mode best`, so
 `mask_all.png`, `fence_grounded_sam_vis.jpg`, and YOLO-seg labels are generated
 from the highest ranked full-fence candidate. Use `--selection-mode all` only
 when you intentionally want to merge every kept GroundingDINO candidate.
 
-Fence mask output modes:
+The current script saves the selected raw SAM2 mask. The STEAD CLI still accepts
+older continuous-band options for command compatibility, but records
+`mask_output_mode: sam` in GuardNet metadata because `fence_grounded_sam_1.py`
+does not perform continuous-band post-processing.
 
-- `--mask-output-mode sam`: save the selected raw SAM2 mask directly.
-- `--mask-output-mode continuous-band`: default. Select the best SAM2 candidate,
-  then fit a continuous fence band from the selected mask endpoints. The endpoint
-  fitter estimates left-top/right-top as the upper fence line and
-  left-bottom/right-bottom as the lower fence line, then fills the region between
-  the two lines.
-
-Useful continuous-band switches:
-
-- `--continuous-band-margin`: expands the final fitted band by a few pixels.
-- `--continuous-band-endpoint-source largest-component`: default; use the
-  largest connected SAM mask component to avoid isolated noise.
-- `--continuous-band-endpoint-source all-mask`: use all selected SAM mask pixels
-  so the fitted band extends to every raw-mask endpoint.
-- `--save-selected-sam-mask`: additionally save `sam_mask_0.png`, the raw SAM2
-  mask selected before continuous-band post-processing.
-
-Typical continuous fence-band command:
+Typical command:
 
 ```bash
-python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_endpoint_all_mask --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-margin 4 --continuous-band-endpoint-source all-mask --save-selected-sam-mask
+python fence_grounded_sam_1.py --image weights/Fence2.png --output outputs/fence_seg --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 0.6 --selection-mode best --target-area-ratio 0.55
 ```
 
 Main outputs:
 
 ```text
-outputs/<run>/mask_0.png                  # final selected mask, after post-processing
+outputs/<run>/mask_0.png                  # final selected SAM2 mask
 outputs/<run>/mask_all.png                # merged final masks
-outputs/<run>/sam_mask_0.png              # optional raw selected SAM2 mask
 outputs/<run>/fence_grounded_sam_vis.jpg  # overlay visualization
 outputs/<run>/detections.json             # candidates, scores, selected indices, paths
 outputs/<run>/labels/<image_stem>.txt     # YOLO-seg label when enabled
@@ -773,17 +758,17 @@ branch or shared externally, rotate it before deployment.
   python -m src.pipeline.analyze_event --input-type video --video examples/SchoolFenceVideo/example --recursive --batch-limit 0 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/test2 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights/yolo11l.pt --sam-temporal-mode fast --sam-sample-every 15 --sam2-enabled true --sam2-config ../sam2-main/sam2/configs/sam2/sam2_hiera_l.yaml --sam2-checkpoint ../sam2-main/checkpoints/sam2_hiera_large.pt --sam2-scan-frames 100 --sam-imgsz 640 --sam-device cuda --guard-net-box-threshold 0.12 --guard-net-text-threshold 0.12 --guard-net-max-box-area-ratio 0.85 --guard-net-candidate-count 12 --guard-net-mask-output-mode continuous-band --guard-net-continuous-band-margin 4 --guard-net-continuous-band-endpoint-source all-mask --guard-net-save-selected-sam-mask true --max-analysis-frames 0 --visualization-max-frames 0
 
   # GroundingDINO + SAM2 fence segmentation
-  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_raw_sam --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode sam --save-selected-sam-mask
+  python fence_grounded_sam_1.py --image weights/Fence2.png --output outputs/fence_seg_raw_sam --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 0.6 --selection-mode best --target-area-ratio 0.55
 
-  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_endpoint_largest --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-margin 4 --continuous-band-endpoint-source largest-component --save-selected-sam-mask
+  python fence_grounded_sam_1.py --image weights/Fence2.png --output outputs/fence_seg_all --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 0.6 --selection-mode all --target-area-ratio 0.55
 
-  python fence_grounded_sam.py --image weights/Fence2.png --output outputs/fence_seg_endpoint_all_mask --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 0.85 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-margin 4 --continuous-band-endpoint-source all-mask --save-selected-sam-mask
+  python fence_grounded_sam_1.py --image weights/Fence2.png --output outputs/fence_seg_roi --crop-roi 0,200,1920,1000 --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 0.6 --selection-mode best
 
-  python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg_endpoint_refit5 --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 1 --sam-candidate-count 12 --mask-output-mode continuous-band --continuous-band-margin 4 --continuous-band-endpoint-source all-mask --continuous-band-min-height-ratio 0.10 --continuous-band-max-height-ratio 0.26 --save-selected-sam-mask --selection-mode best
+  python fence_grounded_sam_1.py --image weights/Fence.png --output outputs/fence_seg_loose_area --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 1 --selection-mode best --target-area-ratio 0.55
 
-  python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg_best_sam --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 1 --selection-mode best --sam-candidate-count 50 --mask-output-mode sam --save-selected-sam-mask
+  python fence_grounded_sam_1.py --image weights/Fence.png --output outputs/fence_seg_best_sam --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 1 --selection-mode best --target-area-ratio 0.55
 
-  python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg_thick_band --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 1 --selection-mode best --sam-candidate-count 50 --mask-output-mode continuous-band --continuous-band-endpoint-source all-mask --continuous-band-margin 4 --continuous-band-min-height-ratio 0.18 --continuous-band-max-height-ratio 0.55 --save-selected-sam-mask
+  python fence_grounded_sam_1.py --image weights/Fence.png --output outputs/fence_seg_target_large --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 1 --selection-mode best --target-area-ratio 0.70
 
-  python fence_grounded_sam.py --image weights/Fence.png --output outputs/fence_seg_old_like --box-threshold 0.12 --text-threshold 0.12 --max-box-area-ratio 1 --selection-mode all --sam-candidate-count 50 --mask-output-mode sam --save-selected-sam-mask
+  python fence_grounded_sam_1.py --image weights/Fence.png --output outputs/fence_seg_old_like --box-threshold 0.15 --text-threshold 0.15 --max-box-area-ratio 1 --selection-mode all --target-area-ratio 0.55
 ```

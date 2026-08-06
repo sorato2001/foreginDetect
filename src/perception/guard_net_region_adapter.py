@@ -8,7 +8,7 @@ judgment path.
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -16,10 +16,7 @@ from typing import Any
 
 
 DEFAULT_GUARD_NET_PROMPT = (
-    "black chain link fence mesh wires. black metal mesh fence posts. "
-    "entire continuous black metal chain link fence long protective mesh fence"
-    "continuous wire guard net. protective wire mesh barrier. fence panels."
-    "entire continuous black metal chain link fence. full fence line. complete wire mesh barrier. long protective mesh fence. continuous guard net along the field boundary. fence panels and posts."
+    "entire continuous black metal chain link fence"
 )
 
 
@@ -28,12 +25,14 @@ class GuardNetRegionConfig:
     """Configuration for GroundingDINO + SAM2 guard-net rule mask generation."""
 
     text_prompt: str = DEFAULT_GUARD_NET_PROMPT
-    box_threshold: float = 0.12
-    text_threshold: float = 0.12
-    max_box_area_ratio: float = 0.85
+    box_threshold: float = 0.15
+    text_threshold: float = 0.15
+    max_box_area_ratio: float = 0.6
     candidate_count: int = 12
     crop_roi: str | None = None
-    mask_output_mode: str = "continuous-band"
+    selection_mode: str = "best"
+    target_area_ratio: float = 0.55
+    mask_output_mode: str = "sam"
     continuous_band_margin: int = 4
     continuous_band_endpoint_source: str = "largest-component"
     save_selected_sam_mask: bool = False
@@ -54,7 +53,7 @@ class GuardNetRegionResult:
     selected_candidate_index: int | None = None
     candidate_count: int = 0
     selection_score: float | None = None
-    mask_output_mode: str = "continuous-band"
+    mask_output_mode: str = "sam"
     fallback_reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -131,11 +130,10 @@ class GuardNetRegionAdapter:
                 filter_large_box=True,
                 max_box_area_ratio=self.config.max_box_area_ratio,
             )
-            selected = fence.select_sam_candidates(
+            selected = fence.select_final_detections(
                 detections,
-                selection_mode="best",
-                target_area_ratio=0.55,
-                candidate_count=self.config.candidate_count,
+                selection_mode=self.config.selection_mode,
+                target_area_ratio=self.config.target_area_ratio,
             )
             if not selected:
                 return self._unavailable(
@@ -152,21 +150,12 @@ class GuardNetRegionAdapter:
             predictor = fence.load_sam2_predictor(sam2_repo, sam2_config, sam2_checkpoint, device)
             masks = fence.run_sam2_on_boxes(
                 predictor,
-                frame_bgr,
                 crop_rgb,
-                selected,
+                detections,
                 roi,
                 (height, width),
                 output_dir,
                 cv2,
-                "best",
-                self.config.mask_output_mode,
-                96,
-                self.config.continuous_band_margin,
-                0.14,
-                0.42,
-                self.config.continuous_band_endpoint_source,
-                self.config.save_selected_sam_mask,
             )
             final_dets = [det for det in selected if det.selected and det.mask_path]
             if not masks or not final_dets:
@@ -187,13 +176,19 @@ class GuardNetRegionAdapter:
                 "box_threshold": self.config.box_threshold,
                 "text_threshold": self.config.text_threshold,
                 "max_box_area_ratio": self.config.max_box_area_ratio,
-                "candidate_count": self.config.candidate_count,
+                "candidate_count": len(detections),
+                "candidate_count_limit": self.config.candidate_count,
+                "selection_mode": self.config.selection_mode,
+                "target_area_ratio": self.config.target_area_ratio,
                 "selected_candidate_index": selected_det.index,
-                "selection_score": selected_det.final_score or selected_det.reliability_score,
-                "mask_output_mode": self.config.mask_output_mode,
+                "selection_score": selected_det.reliability_score,
+                "mask_output_mode": "sam",
+                "requested_mask_output_mode": self.config.mask_output_mode,
                 "continuous_band": {
                     "margin": self.config.continuous_band_margin,
                     "endpoint_source": self.config.continuous_band_endpoint_source,
+                    "available": False,
+                    "fallback_reason": "fence_grounded_sam_1_outputs_raw_sam_masks",
                 },
                 "raw_selected_sam_mask_saved": self.config.save_selected_sam_mask,
                 "fallback_reason": None,
@@ -207,7 +202,7 @@ class GuardNetRegionAdapter:
                     "sam2_checkpoint": str(sam2_checkpoint),
                     "mask_0": selected_det.mask_path,
                     "mask_all": str(all_mask_path),
-                    "sam_mask_0": selected_det.sam_mask_path,
+                    "sam_mask_0": selected_det.mask_path,
                     "visualization": str(output_dir / "fence_grounded_sam_vis.jpg"),
                 },
                 "detections": [asdict(item) for item in detections],
@@ -218,8 +213,8 @@ class GuardNetRegionAdapter:
                 available=bool(mask.sum() > 0),
                 selected_candidate_index=selected_det.index,
                 candidate_count=len(detections),
-                selection_score=float(selected_det.final_score or selected_det.reliability_score),
-                mask_output_mode=self.config.mask_output_mode,
+                selection_score=float(selected_det.reliability_score),
+                mask_output_mode="sam",
                 metadata=metadata,
             )
         except Exception as exc:
@@ -240,12 +235,22 @@ class GuardNetRegionAdapter:
             ]
         )
         for candidate in candidates:
-            script = candidate / "fence_grounded_sam.py"
+            script = candidate / "fence_grounded_sam_1.py"
             if script.exists():
                 if str(candidate.resolve()) not in sys.path:
                     sys.path.insert(0, str(candidate.resolve()))
-                return importlib.import_module("fence_grounded_sam")
-        raise FileNotFoundError("cannot locate GroundingDINO/fence_grounded_sam.py")
+                module_name = "fence_grounded_sam_1"
+                loaded = sys.modules.get(module_name)
+                if loaded is not None and Path(getattr(loaded, "__file__", "")).resolve() == script.resolve():
+                    return loaded
+                spec = importlib.util.spec_from_file_location(module_name, script)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"cannot load module spec from {script}")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                return module
+        raise FileNotFoundError("cannot locate GroundingDINO/fence_grounded_sam_1.py")
 
     @staticmethod
     def _resolve_external_path(path: str | Path, script_dir: Path) -> Path:

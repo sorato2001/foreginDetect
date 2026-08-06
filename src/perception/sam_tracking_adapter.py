@@ -97,15 +97,16 @@ class SAMTrackingConfig:
     progress_interval: int = 10
     output_dir: str | None = None
     guard_net_text_prompt: str = (
-        "black chain link fence mesh wires. black metal mesh fence posts. "
-        "continuous wire guard net. protective wire mesh barrier. fence panels."
+        "entire continuous black metal chain link fence"
     )
-    guard_net_box_threshold: float = 0.12
-    guard_net_text_threshold: float = 0.12
-    guard_net_max_box_area_ratio: float = 0.85
+    guard_net_box_threshold: float = 0.15
+    guard_net_text_threshold: float = 0.15
+    guard_net_max_box_area_ratio: float = 0.6
     guard_net_candidate_count: int = 12
     guard_net_crop_roi: str | None = None
-    guard_net_mask_output_mode: str = "continuous-band"
+    guard_net_selection_mode: str = "best"
+    guard_net_target_area_ratio: float = 0.55
+    guard_net_mask_output_mode: str = "sam"
     guard_net_continuous_band_margin: int = 4
     guard_net_continuous_band_endpoint_source: str = "largest-component"
     guard_net_save_selected_sam_mask: bool = False
@@ -658,6 +659,8 @@ class SAMTrackingAdapter:
                 max_box_area_ratio=self.config.guard_net_max_box_area_ratio,
                 candidate_count=self.config.guard_net_candidate_count,
                 crop_roi=self.config.guard_net_crop_roi,
+                selection_mode=self.config.guard_net_selection_mode,
+                target_area_ratio=self.config.guard_net_target_area_ratio,
                 mask_output_mode=self.config.guard_net_mask_output_mode,
                 continuous_band_margin=self.config.guard_net_continuous_band_margin,
                 continuous_band_endpoint_source=self.config.guard_net_continuous_band_endpoint_source,

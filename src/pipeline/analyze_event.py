@@ -71,12 +71,14 @@ def _guard_net_args_used(args: argparse.Namespace) -> bool:
     """Return true when the user supplied guard-net-specific CLI options."""
     for name, default in {
         "guard_net_text_prompt": SAMTrackingConfig().guard_net_text_prompt,
-        "guard_net_box_threshold": 0.12,
-        "guard_net_text_threshold": 0.12,
-        "guard_net_max_box_area_ratio": 0.85,
+        "guard_net_box_threshold": 0.15,
+        "guard_net_text_threshold": 0.15,
+        "guard_net_max_box_area_ratio": 0.6,
         "guard_net_candidate_count": 12,
         "guard_net_crop_roi": None,
-        "guard_net_mask_output_mode": "continuous-band",
+        "guard_net_selection_mode": "best",
+        "guard_net_target_area_ratio": 0.55,
+        "guard_net_mask_output_mode": "sam",
         "guard_net_continuous_band_margin": 4,
         "guard_net_continuous_band_endpoint_source": "largest-component",
         "guard_net_save_selected_sam_mask": "false",
@@ -275,12 +277,14 @@ def run_pipeline(
     rule_region_source: str = "auto",
     guard_net_requested: bool = False,
     guard_net_text_prompt: str | None = None,
-    guard_net_box_threshold: float = 0.12,
-    guard_net_text_threshold: float = 0.12,
-    guard_net_max_box_area_ratio: float = 0.85,
+    guard_net_box_threshold: float = 0.15,
+    guard_net_text_threshold: float = 0.15,
+    guard_net_max_box_area_ratio: float = 0.6,
     guard_net_candidate_count: int = 12,
     guard_net_crop_roi: str | None = None,
-    guard_net_mask_output_mode: str = "continuous-band",
+    guard_net_selection_mode: str = "best",
+    guard_net_target_area_ratio: float = 0.55,
+    guard_net_mask_output_mode: str = "sam",
     guard_net_continuous_band_margin: int = 4,
     guard_net_continuous_band_endpoint_source: str = "largest-component",
     guard_net_save_selected_sam_mask: bool = False,
@@ -346,6 +350,8 @@ def run_pipeline(
             guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
             guard_net_candidate_count=guard_net_candidate_count,
             guard_net_crop_roi=guard_net_crop_roi,
+            guard_net_selection_mode=guard_net_selection_mode,
+            guard_net_target_area_ratio=guard_net_target_area_ratio,
             guard_net_mask_output_mode=guard_net_mask_output_mode,
             guard_net_continuous_band_margin=guard_net_continuous_band_margin,
             guard_net_continuous_band_endpoint_source=guard_net_continuous_band_endpoint_source,
@@ -578,12 +584,14 @@ def run_video_batch_pipeline(
     rule_region_source: str = "auto",
     guard_net_requested: bool = False,
     guard_net_text_prompt: str | None = None,
-    guard_net_box_threshold: float = 0.12,
-    guard_net_text_threshold: float = 0.12,
-    guard_net_max_box_area_ratio: float = 0.85,
+    guard_net_box_threshold: float = 0.15,
+    guard_net_text_threshold: float = 0.15,
+    guard_net_max_box_area_ratio: float = 0.6,
     guard_net_candidate_count: int = 12,
     guard_net_crop_roi: str | None = None,
-    guard_net_mask_output_mode: str = "continuous-band",
+    guard_net_selection_mode: str = "best",
+    guard_net_target_area_ratio: float = 0.55,
+    guard_net_mask_output_mode: str = "sam",
     guard_net_continuous_band_margin: int = 4,
     guard_net_continuous_band_endpoint_source: str = "largest-component",
     guard_net_save_selected_sam_mask: bool = False,
@@ -650,6 +658,8 @@ def run_video_batch_pipeline(
                 guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
                 guard_net_candidate_count=guard_net_candidate_count,
                 guard_net_crop_roi=guard_net_crop_roi,
+                guard_net_selection_mode=guard_net_selection_mode,
+                guard_net_target_area_ratio=guard_net_target_area_ratio,
                 guard_net_mask_output_mode=guard_net_mask_output_mode,
                 guard_net_continuous_band_margin=guard_net_continuous_band_margin,
                 guard_net_continuous_band_endpoint_source=guard_net_continuous_band_endpoint_source,
@@ -746,16 +756,21 @@ def _sam_tracking_prompt_summary(sam_tracking_result: SAMTrackingResult) -> dict
     alarms = [frame for frame in frames if frame.alarm]
     peak = max(frames, key=lambda frame: max(frame.max_iou, frame.max_object_overlap), default=None)
     sample_frames = alarms[:3] or suspicious[:3] or ([peak] if peak is not None else [])
+    guard_net_meta = sam_tracking_result.metadata.get("guard_net") or {}
+    guard_net_mode = guard_net_meta.get("mask_output_mode")
     return {
         "rule_type": "mask_iou_intrusion",
         "rule_region_source": sam_tracking_result.metadata.get("rule_region_source_resolved"),
-        "rule_region_type": "continuous_guard_net_band"
-        if sam_tracking_result.metadata.get("rule_region_source_resolved") == "guard_net"
-        else "segmentation_mask",
+        "rule_region_type": (
+            "continuous_guard_net_band"
+            if sam_tracking_result.metadata.get("rule_region_source_resolved") == "guard_net"
+            and guard_net_mode == "continuous-band"
+            else "segmentation_mask"
+        ),
         "intrusion_judgment": "mask_iou_and_object_overlap",
         "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
-        "fallback_used": bool((sam_tracking_result.metadata.get("guard_net") or {}).get("fallback_reason")),
-        "fallback_reason": (sam_tracking_result.metadata.get("guard_net") or {}).get("fallback_reason"),
+        "fallback_used": bool(guard_net_meta.get("fallback_reason")),
+        "fallback_reason": guard_net_meta.get("fallback_reason"),
         "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
         "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
         "sample_every": sam_tracking_result.metadata.get("sample_every"),
@@ -842,12 +857,14 @@ def main() -> int:
     parser.add_argument("--sam-imgsz", type=int, default=640, help="YOLO inference image size for SAMTracking")
     parser.add_argument("--sam-progress-interval", type=int, default=10, help="Log SAMTracking progress every N processed frames")
     parser.add_argument("--guard-net-text-prompt", default=SAMTrackingConfig().guard_net_text_prompt)
-    parser.add_argument("--guard-net-box-threshold", type=float, default=0.12)
-    parser.add_argument("--guard-net-text-threshold", type=float, default=0.12)
-    parser.add_argument("--guard-net-max-box-area-ratio", type=float, default=0.85)
+    parser.add_argument("--guard-net-box-threshold", type=float, default=0.15)
+    parser.add_argument("--guard-net-text-threshold", type=float, default=0.15)
+    parser.add_argument("--guard-net-max-box-area-ratio", type=float, default=0.6)
     parser.add_argument("--guard-net-candidate-count", type=int, default=12)
     parser.add_argument("--guard-net-crop-roi", default=None)
-    parser.add_argument("--guard-net-mask-output-mode", choices=["sam", "continuous-band"], default="continuous-band")
+    parser.add_argument("--guard-net-selection-mode", choices=["best", "all"], default="best")
+    parser.add_argument("--guard-net-target-area-ratio", type=float, default=0.55)
+    parser.add_argument("--guard-net-mask-output-mode", choices=["sam", "continuous-band"], default="sam")
     parser.add_argument("--guard-net-continuous-band-margin", type=int, default=4)
     parser.add_argument("--guard-net-continuous-band-endpoint-source", choices=["largest-component", "all-mask"], default="largest-component")
     parser.add_argument("--guard-net-save-selected-sam-mask", default="false")
@@ -900,6 +917,8 @@ def main() -> int:
                 guard_net_max_box_area_ratio=args.guard_net_max_box_area_ratio,
                 guard_net_candidate_count=args.guard_net_candidate_count,
                 guard_net_crop_roi=args.guard_net_crop_roi,
+                guard_net_selection_mode=args.guard_net_selection_mode,
+                guard_net_target_area_ratio=args.guard_net_target_area_ratio,
                 guard_net_mask_output_mode=args.guard_net_mask_output_mode,
                 guard_net_continuous_band_margin=args.guard_net_continuous_band_margin,
                 guard_net_continuous_band_endpoint_source=args.guard_net_continuous_band_endpoint_source,
@@ -946,6 +965,8 @@ def main() -> int:
                 guard_net_max_box_area_ratio=args.guard_net_max_box_area_ratio,
                 guard_net_candidate_count=args.guard_net_candidate_count,
                 guard_net_crop_roi=args.guard_net_crop_roi,
+                guard_net_selection_mode=args.guard_net_selection_mode,
+                guard_net_target_area_ratio=args.guard_net_target_area_ratio,
                 guard_net_mask_output_mode=args.guard_net_mask_output_mode,
                 guard_net_continuous_band_margin=args.guard_net_continuous_band_margin,
                 guard_net_continuous_band_endpoint_source=args.guard_net_continuous_band_endpoint_source,
@@ -1003,6 +1024,8 @@ def main() -> int:
                 guard_net_max_box_area_ratio=args.guard_net_max_box_area_ratio,
                 guard_net_candidate_count=args.guard_net_candidate_count,
                 guard_net_crop_roi=args.guard_net_crop_roi,
+                guard_net_selection_mode=args.guard_net_selection_mode,
+                guard_net_target_area_ratio=args.guard_net_target_area_ratio,
                 guard_net_mask_output_mode=args.guard_net_mask_output_mode,
                 guard_net_continuous_band_margin=args.guard_net_continuous_band_margin,
                 guard_net_continuous_band_endpoint_source=args.guard_net_continuous_band_endpoint_source,
@@ -1058,6 +1081,8 @@ def main() -> int:
                 guard_net_max_box_area_ratio=args.guard_net_max_box_area_ratio,
                 guard_net_candidate_count=args.guard_net_candidate_count,
                 guard_net_crop_roi=args.guard_net_crop_roi,
+                guard_net_selection_mode=args.guard_net_selection_mode,
+                guard_net_target_area_ratio=args.guard_net_target_area_ratio,
                 guard_net_mask_output_mode=args.guard_net_mask_output_mode,
                 guard_net_continuous_band_margin=args.guard_net_continuous_band_margin,
                 guard_net_continuous_band_endpoint_source=args.guard_net_continuous_band_endpoint_source,
