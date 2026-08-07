@@ -19,3 +19,4 @@ runs/
 examples/
 weights/
 src/segment-anything-2
+.codex-test-tmp/

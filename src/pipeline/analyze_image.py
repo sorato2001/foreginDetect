@@ -23,6 +23,7 @@ from src.perception.yolo_detector import YoloDetector
 from src.pipeline.analyze_event import (
     _configure_pipeline_logging,
     _copy_batch_visualizations,
+    _sam_tracking_evidence_metadata,
     _sam_tracking_mask_iou_rule,
     _sam_tracking_prompt_summary,
     _sam_tracking_rule_source,
@@ -125,6 +126,24 @@ def run_image_pipeline(
     sam_object_overlap_threshold: float = 0.15,
     sam_imgsz: int = 640,
     rule_region_source: str = "auto",
+    guard_net_configured: bool = False,
+    guard_net_backend: str = "grounding_dino",
+    guard_net_text_prompt: str = "black chain link fence. black metal mesh fence. wire mesh fence. protective fence.",
+    guard_net_model: str = "weights/groundingdino_swint_ogc.pth",
+    guard_net_config: str = "groundingdino/config/GroundingDINO_SwinT_OGC.py",
+    guard_net_checkpoint: str = "weights/groundingdino_swint_ogc.pth",
+    guard_net_box_threshold: float = 0.10,
+    guard_net_text_threshold: float = 0.10,
+    guard_net_nms_threshold: float = 0.50,
+    guard_net_max_box_area_ratio: float = 0.60,
+    guard_net_scan_frames: int = 30,
+    guard_net_sample_every: int = 5,
+    guard_net_band_side_fraction: float = 0.08,
+    guard_net_band_top_padding: int = 0,
+    guard_net_band_bottom_padding: int = 0,
+    guard_net_band_horizontal_padding: int = 0,
+    guard_net_export_yolo_seg: bool = False,
+    guard_net_yolo_class_id: int = 0,
 ) -> dict[str, Any]:
     """Run STEAD analysis on a single image and write standard artifacts."""
     event_id = event_id or f"image_{uuid.uuid4().hex[:8]}"
@@ -155,7 +174,7 @@ def run_image_pipeline(
     if tracker == "sam_tracking" and not mock_detections:
         from src.pipeline.analyze_event import _resolve_rule_region_source
 
-        resolved_rule_region_source = _resolve_rule_region_source(rule_region_source, tracker, sam_track_model)
+        resolved_rule_region_source = _resolve_rule_region_source(rule_region_source, tracker, sam_track_model, guard_net_configured)
         sam_config = SAMTrackingConfig(
             object_model_path=sam_object_model or SAMTrackingConfig().object_model_path,
             track_model_path=sam_track_model or SAMTrackingConfig().track_model_path,
@@ -169,11 +188,29 @@ def run_image_pipeline(
             confirm_count=1,
             sam2_config=sam2_config,
             sam2_checkpoint=sam2_checkpoint,
-            sam2_enabled=sam2_enabled,
+            sam2_enabled=False,
             sample_every=1,
             track_mask_interval=1,
             imgsz=sam_imgsz,
             output_dir=str(out),
+            guard_net_backend=guard_net_backend,
+            guard_net_text_prompt=guard_net_text_prompt,
+            guard_net_model=guard_net_model,
+            guard_net_config=guard_net_config,
+            guard_net_checkpoint=guard_net_checkpoint,
+            guard_net_box_threshold=guard_net_box_threshold,
+            guard_net_text_threshold=guard_net_text_threshold,
+            guard_net_nms_threshold=guard_net_nms_threshold,
+            guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
+            guard_net_scan_frames=guard_net_scan_frames,
+            guard_net_sample_every=guard_net_sample_every,
+            guard_net_band_side_fraction=guard_net_band_side_fraction,
+            guard_net_band_top_padding=guard_net_band_top_padding,
+            guard_net_band_bottom_padding=guard_net_band_bottom_padding,
+            guard_net_band_horizontal_padding=guard_net_band_horizontal_padding,
+            guard_net_export_yolo_seg=guard_net_export_yolo_seg,
+            guard_net_yolo_class_id=guard_net_yolo_class_id,
+            sam_track_fallback_enabled=rule_region_source == "auto" and bool(sam_track_model),
         )
         sam_tracking_result = _detect_image_with_sam_tracking(image_path, sam_config)
         tracks = sam_tracking_result.tracks
@@ -245,17 +282,7 @@ def run_image_pipeline(
     if sam_tracking_result is not None:
         sam_tracking_artifact = str(out / "sam_tracking_result.json")
         save_json(sam_tracking_result.to_json_dict(), sam_tracking_artifact)
-        evidence.metadata["sam_tracking"] = {
-            "artifact": sam_tracking_artifact,
-            "degraded": sam_tracking_result.metadata.get("degraded"),
-            "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
-            "intrusion_events": len(sam_tracking_result.intrusion_events),
-            "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
-            "rule_region_source": sam_tracking_result.metadata.get("rule_region_source_resolved"),
-            "rule_region_available": sam_tracking_result.metadata.get("rule_region_available"),
-            "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
-            "summary": _sam_tracking_prompt_summary(sam_tracking_result),
-        }
+        evidence.metadata["sam_tracking"] = _sam_tracking_evidence_metadata(sam_tracking_result, sam_tracking_artifact)
         logger.info(
             "STEP 05 windows: SAMTracking artifact=%s degraded=%s intrusion_events=%s",
             sam_tracking_artifact,
@@ -371,6 +398,24 @@ def run_image_batch_pipeline(
     sam_object_overlap_threshold: float = 0.15,
     sam_imgsz: int = 640,
     rule_region_source: str = "auto",
+    guard_net_configured: bool = False,
+    guard_net_backend: str = "grounding_dino",
+    guard_net_text_prompt: str = "black chain link fence. black metal mesh fence. wire mesh fence. protective fence.",
+    guard_net_model: str = "weights/groundingdino_swint_ogc.pth",
+    guard_net_config: str = "groundingdino/config/GroundingDINO_SwinT_OGC.py",
+    guard_net_checkpoint: str = "weights/groundingdino_swint_ogc.pth",
+    guard_net_box_threshold: float = 0.10,
+    guard_net_text_threshold: float = 0.10,
+    guard_net_nms_threshold: float = 0.50,
+    guard_net_max_box_area_ratio: float = 0.60,
+    guard_net_scan_frames: int = 30,
+    guard_net_sample_every: int = 5,
+    guard_net_band_side_fraction: float = 0.08,
+    guard_net_band_top_padding: int = 0,
+    guard_net_band_bottom_padding: int = 0,
+    guard_net_band_horizontal_padding: int = 0,
+    guard_net_export_yolo_seg: bool = False,
+    guard_net_yolo_class_id: int = 0,
     recursive: bool = False,
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -416,6 +461,24 @@ def run_image_batch_pipeline(
                 sam_object_overlap_threshold=sam_object_overlap_threshold,
                 sam_imgsz=sam_imgsz,
                 rule_region_source=rule_region_source,
+                guard_net_configured=guard_net_configured,
+                guard_net_backend=guard_net_backend,
+                guard_net_text_prompt=guard_net_text_prompt,
+                guard_net_model=guard_net_model,
+                guard_net_config=guard_net_config,
+                guard_net_checkpoint=guard_net_checkpoint,
+                guard_net_box_threshold=guard_net_box_threshold,
+                guard_net_text_threshold=guard_net_text_threshold,
+                guard_net_nms_threshold=guard_net_nms_threshold,
+                guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
+                guard_net_scan_frames=guard_net_scan_frames,
+                guard_net_sample_every=guard_net_sample_every,
+                guard_net_band_side_fraction=guard_net_band_side_fraction,
+                guard_net_band_top_padding=guard_net_band_top_padding,
+                guard_net_band_bottom_padding=guard_net_band_bottom_padding,
+                guard_net_band_horizontal_padding=guard_net_band_horizontal_padding,
+                guard_net_export_yolo_seg=guard_net_export_yolo_seg,
+                guard_net_yolo_class_id=guard_net_yolo_class_id,
             )
             result["source_image"] = str(item)
             copied_visualizations = _copy_batch_visualizations(result, batch_vis_dir, f"{index:04d}_{item.stem}")

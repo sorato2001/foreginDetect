@@ -96,6 +96,24 @@ class SAMTrackingConfig:
     imgsz: int = 640
     progress_interval: int = 10
     output_dir: str | None = None
+    guard_net_backend: str = "grounding_dino"
+    guard_net_text_prompt: str = "black chain link fence. black metal mesh fence. wire mesh fence. protective fence."
+    guard_net_model: str = "weights/groundingdino_swint_ogc.pth"
+    guard_net_config: str = "groundingdino/config/GroundingDINO_SwinT_OGC.py"
+    guard_net_checkpoint: str = "weights/groundingdino_swint_ogc.pth"
+    guard_net_box_threshold: float = 0.10
+    guard_net_text_threshold: float = 0.10
+    guard_net_nms_threshold: float = 0.50
+    guard_net_max_box_area_ratio: float = 0.60
+    guard_net_scan_frames: int = 30
+    guard_net_sample_every: int = 5
+    guard_net_band_side_fraction: float = 0.08
+    guard_net_band_top_padding: int = 0
+    guard_net_band_bottom_padding: int = 0
+    guard_net_band_horizontal_padding: int = 0
+    guard_net_export_yolo_seg: bool = False
+    guard_net_yolo_class_id: int = 0
+    sam_track_fallback_enabled: bool = False
 
 
 @dataclass(slots=True)
@@ -265,6 +283,10 @@ class SAMTrackingAdapter:
         self._sam2_tracker: _SAM2VideoMemoryTracker | None = None
         self._sam2_temp_video: Path | None = None
         self._smoothers: dict[int, _OpticalFlowProbabilitySmoother] = {}
+        self._guard_net_result: Any | None = None
+        self._guard_net_generator: Any | None = None
+        self._guard_net_error: str | None = None
+        self._resolved_rule_region_source = (self.config.rule_region_source or "sam_track").strip().lower()
         self._load_models()
 
     def analyze_video(self, video_path: str, max_frames: int | None = 900) -> SAMTrackingResult:
@@ -317,6 +339,8 @@ class SAMTrackingAdapter:
         track_mask_seen = False
         detection_seen = False
         cached_track_mask: Any | None = None
+        if self._resolved_rule_region_source == "guard_net":
+            self._scan_guard_net_video(video_path, max_frames=max_frames)
         if self.config.sam2_enabled:
             self._initialize_sam2_video(video_path, fps, max_frames, total_frames=total_frames)
         logger.info(
@@ -387,7 +411,7 @@ class SAMTrackingAdapter:
                     suspicious=bool(state["suspicious"]),
                     window_count=int(state["window_count"]),
                     alarm=bool(state["alarm"]),
-                    rule_region_source=self.config.rule_region_source,
+                    rule_region_source=self._resolved_rule_region_source,
                     rule_region_available=rule_region_available,
                     rule_region_mask_area=rule_region_mask_area,
                     track_mask_contours=track_mask_contours,
@@ -410,7 +434,7 @@ class SAMTrackingAdapter:
 
         cap.release()
         duration = frame_index / fps if fps > 0 else 0.0
-        needs_track_model = (self.config.rule_region_source or "sam_track") == "sam_track"
+        needs_track_model = self._resolved_rule_region_source == "sam_track"
         degraded = self._object_model is None or (needs_track_model and self._track_model is None) or self._sam2_error is not None
         metadata = self._metadata(degraded=degraded)
         metadata.update(
@@ -497,14 +521,14 @@ class SAMTrackingAdapter:
                 suspicious=bool(state["suspicious"]),
                 window_count=int(state["window_count"]),
                 alarm=bool(state["alarm"]),
-                rule_region_source=self.config.rule_region_source,
+                rule_region_source=self._resolved_rule_region_source,
                 rule_region_available=track_mask_seen,
                 rule_region_mask_area=rule_region_mask_area,
                 track_mask_contours=mask_to_contours(track_mask) if track_mask is not None else [],
                 object_mask_contours=[mask_to_contours(mask) for mask in object_masks],
             )
         ]
-        needs_track_model = (self.config.rule_region_source or "sam_track") == "sam_track"
+        needs_track_model = self._resolved_rule_region_source == "sam_track"
         degraded = self._object_model is None or (needs_track_model and self._track_model is None)
         metadata = self._metadata(degraded=degraded)
         metadata.update(
@@ -565,11 +589,111 @@ class SAMTrackingAdapter:
 
     def detect_track_mask(self, frame: Any) -> Any | None:
         """Segment railway/track region with best.pt when available."""
-        source = (self.config.rule_region_source or "sam_track").strip().lower()
+        source = getattr(self, "_resolved_rule_region_source", (self.config.rule_region_source or "sam_track").strip().lower())
         if source == "yaml":
+            return None
+        if source == "guard_net":
+            mask = self._detect_guard_net_mask(frame)
+            if mask is not None:
+                return mask
+            if self.config.sam_track_fallback_enabled and self._track_model is not None:
+                fallback = self._detect_sam_track_mask(frame)
+                if fallback is not None:
+                    self._resolved_rule_region_source = "sam_track"
+                    self._guard_net_error = f"guard_net_unavailable: {self._guard_net_error or 'unknown_error'}; fallback=sam_track"
+                    return fallback
+            self._resolved_rule_region_source = "yaml"
             return None
         if self._track_model is None:
             return None
+        return self._detect_sam_track_mask(frame)
+
+    def _detect_guard_net_mask(self, frame: Any) -> Any | None:
+        """Generate and cache a static GroundingDINO/SAM2 guard-net mask."""
+        if self._guard_net_result is not None:
+            return getattr(self._guard_net_result, "continuous_mask", None)
+        try:
+            if self._guard_net_generator is None:
+                self._guard_net_generator = self._create_guard_net_generator()
+            self._guard_net_result = self._guard_net_generator.generate(frame)
+            if not self._guard_net_result.available:
+                self._guard_net_error = self._guard_net_result.error or "guard_net_unavailable"
+                logger.warning("Guard-net rule region unavailable: %s", self._guard_net_error)
+                return None
+            return self._guard_net_result.continuous_mask
+        except Exception as exc:
+            self._guard_net_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("Guard-net rule region failed: %s", self._guard_net_error)
+            return None
+
+    def _create_guard_net_generator(self) -> Any:
+        from src.perception.guard_net_rule_region import GuardNetConfig, GuardNetRuleRegionGenerator
+
+        output_dir = Path(self.config.output_dir) / "guard_net" if self.config.output_dir else None
+        return GuardNetRuleRegionGenerator(
+            GuardNetConfig(
+                backend=self.config.guard_net_backend,
+                text_prompt=self.config.guard_net_text_prompt,
+                model_path=self.config.guard_net_model,
+                config_path=self.config.guard_net_config,
+                checkpoint_path=self.config.guard_net_checkpoint,
+                sam2_config=self.config.sam2_config,
+                sam2_checkpoint=self.config.sam2_checkpoint,
+                box_threshold=self.config.guard_net_box_threshold,
+                text_threshold=self.config.guard_net_text_threshold,
+                nms_threshold=self.config.guard_net_nms_threshold,
+                max_box_area_ratio=self.config.guard_net_max_box_area_ratio,
+                scan_frames=self.config.guard_net_scan_frames,
+                sample_every=self.config.guard_net_sample_every,
+                band_side_fraction=self.config.guard_net_band_side_fraction,
+                band_top_padding=self.config.guard_net_band_top_padding,
+                band_bottom_padding=self.config.guard_net_band_bottom_padding,
+                band_horizontal_padding=self.config.guard_net_band_horizontal_padding,
+                export_yolo_seg=self.config.guard_net_export_yolo_seg,
+                yolo_class_id=self.config.guard_net_yolo_class_id,
+                output_dir=str(output_dir) if output_dir else None,
+            ),
+            device=self._runtime_device,
+        )
+
+    def _scan_guard_net_video(self, video_path: str, max_frames: int | None) -> None:
+        """Select one reliable static GuardNet region from sampled opening frames."""
+        try:
+            import cv2
+
+            generator = self._create_guard_net_generator()
+            self._guard_net_generator = generator
+            scan_limit = max(1, int(self.config.guard_net_scan_frames))
+            if max_frames:
+                scan_limit = min(scan_limit, max_frames)
+            sample_every = max(1, int(self.config.guard_net_sample_every))
+            cap = cv2.VideoCapture(video_path)
+            sampled_results: list[Any] = []
+            visualization_frame = None
+            frame_index = 0
+            while frame_index < scan_limit:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if frame_index % sample_every == 0:
+                    result = generator.generate(frame)
+                    result.metadata["source_frame_index"] = frame_index
+                    if result.mask_all is not None:
+                        sampled_results.append(result)
+                        if visualization_frame is None:
+                            visualization_frame = frame.copy()
+                frame_index += 1
+            cap.release()
+            if sampled_results:
+                self._guard_net_result = generator.aggregate_results(sampled_results, visualization_frame)
+            else:
+                self._guard_net_error = "guard_net_scan_no_valid_mask_all"
+        except Exception as exc:
+            self._guard_net_error = f"guard_net_scan_failed: {type(exc).__name__}: {exc}"
+            logger.warning("GuardNet video scan failed: %s", self._guard_net_error)
+
+    def _detect_sam_track_mask(self, frame: Any) -> Any | None:
+        """Segment the configured rule region with the existing YOLO model."""
         try:
             import cv2
             import numpy as np
@@ -684,7 +808,10 @@ class SAMTrackingAdapter:
             return
 
         self._object_model = self._try_load_yolo(YOLO, self.config.object_model_path, "object")
-        if (self.config.rule_region_source or "sam_track") == "sam_track":
+        needs_track_model = self._resolved_rule_region_source == "sam_track" or (
+            self._resolved_rule_region_source == "guard_net" and self.config.sam_track_fallback_enabled
+        )
+        if needs_track_model:
             self._track_model = self._try_load_yolo(YOLO, self.config.track_model_path, "track")
         else:
             self._track_model = None
@@ -859,8 +986,10 @@ class SAMTrackingAdapter:
 
     def _metadata(self, degraded: bool, error: str | None = None) -> dict[str, Any]:
         requested = self.config.rule_region_source_requested or self.config.rule_region_source
-        resolved = self.config.rule_region_source or requested
-        if resolved == "sam_track":
+        resolved = getattr(self, "_resolved_rule_region_source", None) or self.config.rule_region_source or requested
+        if resolved == "guard_net":
+            rule_region_available = bool(self._guard_net_result is not None and self._guard_net_result.available)
+        elif resolved == "sam_track":
             rule_region_available = self._track_model is not None
         else:
             rule_region_available = False
@@ -884,6 +1013,8 @@ class SAMTrackingAdapter:
             "rule_region_source_requested": requested,
             "rule_region_source_resolved": resolved,
             "rule_region_available": rule_region_available,
+            "rule_region_fallback_reason": self._guard_net_error,
+            "guard_net": self._guard_net_metadata(),
             "object_model_path": self.config.object_model_path,
             "track_model_path": self.config.track_model_path,
             "object_model_loaded": self._object_model is not None,
@@ -905,6 +1036,17 @@ class SAMTrackingAdapter:
             "use_optical_flow": self.config.use_optical_flow,
             "imgsz": self.config.imgsz,
         }
+
+    def _guard_net_metadata(self) -> dict[str, Any]:
+        if self._guard_net_result is None:
+            return {"enabled": self.config.rule_region_source == "guard_net", "error": self._guard_net_error}
+        metadata = dict(getattr(self._guard_net_result, "metadata", {}) or {})
+        metadata["error"] = getattr(self._guard_net_result, "error", None)
+        metadata["candidate_boxes"] = getattr(self._guard_net_result, "candidate_boxes", [])
+        metadata["candidate_scores"] = getattr(self._guard_net_result, "candidate_scores", [])
+        metadata["selected_candidate"] = getattr(self._guard_net_result, "selected_candidate", None)
+        metadata["continuous_band"] = getattr(self._guard_net_result, "continuous_band_geometry", None)
+        return metadata
 
     @staticmethod
     def _resolve_device(requested: str) -> str:

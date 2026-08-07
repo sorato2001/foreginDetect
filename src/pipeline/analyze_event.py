@@ -34,6 +34,7 @@ logger = logging.getLogger("stead.pipeline")
 
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".webm"}
 RUN_CONFIG_FILENAME = "run_config.json"
+GUARD_NET_DEFAULT_PROMPT = "black chain link fence. black metal mesh fence. wire mesh fence. protective fence."
 
 
 def _copy_batch_visualizations(result: dict[str, Any], batch_vis_dir: Path, prefix: str) -> list[dict[str, str]]:
@@ -149,7 +150,7 @@ def _result_output_dirs(result: dict[str, Any], root_output: str) -> list[str]:
 def _validate_rule_region_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Fail fast for rule-region source combinations that cannot work."""
     source = args.rule_region_source
-    if args.tracker != "sam_tracking" and source == "sam_track":
+    if args.tracker != "sam_tracking" and source in {"sam_track", "guard_net"}:
         parser.error(f"rule-region-source={source} requires --tracker sam_tracking.")
     if source == "sam_track" and not args.sam_track_model:
         parser.error("rule-region-source=sam_track requires --sam-track-model.")
@@ -157,13 +158,25 @@ def _validate_rule_region_args(parser: argparse.ArgumentParser, args: argparse.N
         return
 
 
-def _resolve_rule_region_source(requested: str, tracker: str, sam_track_model: str | None) -> str:
-    """Resolve auto/yaml/sam_track into the source used by SAMTracking."""
+def _guard_net_args_used(argv: list[str]) -> bool:
+    """Return whether the user explicitly supplied any GuardNet option."""
+    return any(item == "--rule-region-source=guard_net" or item.startswith("--guard-net-") for item in argv)
+
+
+def _resolve_rule_region_source(
+    requested: str,
+    tracker: str,
+    sam_track_model: str | None,
+    guard_net_configured: bool = False,
+) -> str:
+    """Resolve auto into the first configured SAMTracking rule-region source."""
     requested = (requested or "auto").strip().lower()
     if tracker != "sam_tracking":
         return "yaml"
     if requested != "auto":
         return requested
+    if guard_net_configured:
+        return "guard_net"
     if sam_track_model:
         return "sam_track"
     return "yaml"
@@ -325,6 +338,24 @@ def run_pipeline(
     sam_imgsz: int = 640,
     sam_progress_interval: int = 10,
     rule_region_source: str = "auto",
+    guard_net_configured: bool = False,
+    guard_net_backend: str = "grounding_dino",
+    guard_net_text_prompt: str = GUARD_NET_DEFAULT_PROMPT,
+    guard_net_model: str = "weights/groundingdino_swint_ogc.pth",
+    guard_net_config: str = "groundingdino/config/GroundingDINO_SwinT_OGC.py",
+    guard_net_checkpoint: str = "weights/groundingdino_swint_ogc.pth",
+    guard_net_box_threshold: float = 0.10,
+    guard_net_text_threshold: float = 0.10,
+    guard_net_nms_threshold: float = 0.50,
+    guard_net_max_box_area_ratio: float = 0.60,
+    guard_net_scan_frames: int = 30,
+    guard_net_sample_every: int = 5,
+    guard_net_band_side_fraction: float = 0.08,
+    guard_net_band_top_padding: int = 0,
+    guard_net_band_bottom_padding: int = 0,
+    guard_net_band_horizontal_padding: int = 0,
+    guard_net_export_yolo_seg: bool = False,
+    guard_net_yolo_class_id: int = 0,
 ) -> dict:
     """Run STEAD event analysis and write JSON artifacts."""
     event_id = event_id or f"event_{uuid.uuid4().hex[:8]}"
@@ -341,7 +372,7 @@ def run_pipeline(
         effective_vlm_provider,
         vlm_mode,
     )
-    resolved_rule_region_source = _resolve_rule_region_source(rule_region_source, tracker, sam_track_model)
+    resolved_rule_region_source = _resolve_rule_region_source(rule_region_source, tracker, sam_track_model, guard_net_configured)
     logger.info(
         "STEP 01 config: rules=%s tracker=%s rule_region_source=%s resolved_rule_region_source=%s mock_detections=%s max_analysis_frames=%s save_visualization=%s visualization_max_frames=%s",
         rules_path,
@@ -381,6 +412,24 @@ def run_pipeline(
             imgsz=sam_imgsz,
             progress_interval=sam_progress_interval,
             output_dir=str(out),
+            guard_net_backend=guard_net_backend,
+            guard_net_text_prompt=guard_net_text_prompt,
+            guard_net_model=guard_net_model,
+            guard_net_config=guard_net_config,
+            guard_net_checkpoint=guard_net_checkpoint,
+            guard_net_box_threshold=guard_net_box_threshold,
+            guard_net_text_threshold=guard_net_text_threshold,
+            guard_net_nms_threshold=guard_net_nms_threshold,
+            guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
+            guard_net_scan_frames=guard_net_scan_frames,
+            guard_net_sample_every=guard_net_sample_every,
+            guard_net_band_side_fraction=guard_net_band_side_fraction,
+            guard_net_band_top_padding=guard_net_band_top_padding,
+            guard_net_band_bottom_padding=guard_net_band_bottom_padding,
+            guard_net_band_horizontal_padding=guard_net_band_horizontal_padding,
+            guard_net_export_yolo_seg=guard_net_export_yolo_seg,
+            guard_net_yolo_class_id=guard_net_yolo_class_id,
+            sam_track_fallback_enabled=rule_region_source == "auto" and bool(sam_track_model),
         )
         sam_tracking_result = _detect_video_with_sam_tracking(
             video_path,
@@ -446,17 +495,7 @@ def run_pipeline(
     if sam_tracking_result is not None:
         sam_tracking_artifact = str(out / "sam_tracking_result.json")
         save_json(sam_tracking_result.to_json_dict(), sam_tracking_artifact)
-        evidence.metadata["sam_tracking"] = {
-            "artifact": sam_tracking_artifact,
-            "degraded": sam_tracking_result.metadata.get("degraded"),
-            "processed_frames": sam_tracking_result.metadata.get("processed_frames"),
-            "intrusion_events": len(sam_tracking_result.intrusion_events),
-            "track_mask_seen": sam_tracking_result.metadata.get("track_mask_seen"),
-            "rule_region_source": sam_tracking_result.metadata.get("rule_region_source_resolved"),
-            "rule_region_available": sam_tracking_result.metadata.get("rule_region_available"),
-            "detections_seen": sam_tracking_result.metadata.get("detections_seen"),
-            "summary": _sam_tracking_prompt_summary(sam_tracking_result),
-        }
+        evidence.metadata["sam_tracking"] = _sam_tracking_evidence_metadata(sam_tracking_result, sam_tracking_artifact)
         logger.info(
             "STEP 05 windows: SAMTracking artifact=%s degraded=%s intrusion_events=%s",
             sam_tracking_artifact,
@@ -597,6 +636,24 @@ def run_video_batch_pipeline(
     sam_imgsz: int = 640,
     sam_progress_interval: int = 10,
     rule_region_source: str = "auto",
+    guard_net_configured: bool = False,
+    guard_net_backend: str = "grounding_dino",
+    guard_net_text_prompt: str = GUARD_NET_DEFAULT_PROMPT,
+    guard_net_model: str = "weights/groundingdino_swint_ogc.pth",
+    guard_net_config: str = "groundingdino/config/GroundingDINO_SwinT_OGC.py",
+    guard_net_checkpoint: str = "weights/groundingdino_swint_ogc.pth",
+    guard_net_box_threshold: float = 0.10,
+    guard_net_text_threshold: float = 0.10,
+    guard_net_nms_threshold: float = 0.50,
+    guard_net_max_box_area_ratio: float = 0.60,
+    guard_net_scan_frames: int = 30,
+    guard_net_sample_every: int = 5,
+    guard_net_band_side_fraction: float = 0.08,
+    guard_net_band_top_padding: int = 0,
+    guard_net_band_bottom_padding: int = 0,
+    guard_net_band_horizontal_padding: int = 0,
+    guard_net_export_yolo_seg: bool = False,
+    guard_net_yolo_class_id: int = 0,
     recursive: bool = False,
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -653,6 +710,24 @@ def run_video_batch_pipeline(
                 sam_imgsz=sam_imgsz,
                 sam_progress_interval=sam_progress_interval,
                 rule_region_source=rule_region_source,
+                guard_net_configured=guard_net_configured,
+                guard_net_backend=guard_net_backend,
+                guard_net_text_prompt=guard_net_text_prompt,
+                guard_net_model=guard_net_model,
+                guard_net_config=guard_net_config,
+                guard_net_checkpoint=guard_net_checkpoint,
+                guard_net_box_threshold=guard_net_box_threshold,
+                guard_net_text_threshold=guard_net_text_threshold,
+                guard_net_nms_threshold=guard_net_nms_threshold,
+                guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
+                guard_net_scan_frames=guard_net_scan_frames,
+                guard_net_sample_every=guard_net_sample_every,
+                guard_net_band_side_fraction=guard_net_band_side_fraction,
+                guard_net_band_top_padding=guard_net_band_top_padding,
+                guard_net_band_bottom_padding=guard_net_band_bottom_padding,
+                guard_net_band_horizontal_padding=guard_net_band_horizontal_padding,
+                guard_net_export_yolo_seg=guard_net_export_yolo_seg,
+                guard_net_yolo_class_id=guard_net_yolo_class_id,
             )
             result["source_video"] = str(item)
             copied_visualizations = _copy_batch_visualizations(result, batch_vis_dir, f"{index:04d}_{item.stem}")
@@ -787,6 +862,52 @@ def _sam_tracking_prompt_summary(sam_tracking_result: SAMTrackingResult) -> dict
     }
 
 
+def _sam_tracking_evidence_metadata(sam_tracking_result: SAMTrackingResult, artifact: str) -> dict[str, Any]:
+    """Expose rule-region geometry and intrusion facts to evidence/VLM consumers."""
+    metadata = sam_tracking_result.metadata
+    guard_net = metadata.get("guard_net") or {}
+    geometry = guard_net.get("continuous_band") or {}
+    summary = _sam_tracking_prompt_summary(sam_tracking_result)
+    actual_rule_region_available = _sam_tracking_has_track_mask(sam_tracking_result)
+    events = [
+        {
+            "event_id": item.event_id,
+            "start_frame": item.start_frame,
+            "end_frame": item.end_frame,
+            "peak_iou": item.peak_iou,
+            "frames_suspicious": item.frames_suspicious,
+        }
+        for item in sam_tracking_result.intrusion_events
+    ]
+    return {
+        "artifact": artifact,
+        "degraded": metadata.get("degraded"),
+        "processed_frames": metadata.get("processed_frames"),
+        "intrusion_events": len(events),
+        "track_mask_seen": actual_rule_region_available,
+        "rule_region_source": metadata.get("rule_region_source_resolved"),
+        "rule_region_available": actual_rule_region_available,
+        "detections_seen": metadata.get("detections_seen"),
+        "rule_region": {
+            "source": metadata.get("rule_region_source_resolved"),
+            "available": actual_rule_region_available,
+            "text_prompt": guard_net.get("text_prompt"),
+            "source_frame_index": guard_net.get("source_frame_index", guard_net.get("source_frame_indices")),
+            "confidence": guard_net.get("aggregate_confidence", guard_net.get("selected_candidate_score")),
+            "continuous_band_polygon": geometry.get("polygon"),
+            "continuous_band_area": geometry.get("continuous_mask_area"),
+        },
+        "person_mask_intrusion_evidence": {
+            "max_mask_iou": summary["max_iou"],
+            "max_object_overlap": summary["max_object_overlap"],
+            "suspicious_frame_count": summary["suspicious_frame_count"],
+            "confirmed_alarm_frame_count": summary["alarm_frame_count"],
+            "intrusion_events": events,
+        },
+        "summary": summary,
+    }
+
+
 def main() -> int:
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Analyze one surveillance event with STEAD.")
@@ -814,7 +935,7 @@ def main() -> int:
     parser.add_argument("--visualization-max-frames", type=int, default=300, help="Max annotated-video frames; 0 means full video")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--tracker", "--track", dest="tracker", choices=["simple_iou", "sam_tracking"], default="simple_iou")
-    parser.add_argument("--rule-region-source", choices=["yaml", "sam_track", "auto"], default="auto")
+    parser.add_argument("--rule-region-source", choices=["yaml", "sam_track", "guard_net", "auto"], default="auto")
     parser.add_argument("--sam-object-model", default=None, help="YOLO11 object model path for SAMTracking")
     parser.add_argument("--sam-track-model", default=None, help="Rail/track segmentation best.pt path for SAMTracking")
     parser.add_argument("--sam-track-labels", default=None, help="Comma-separated segmentation labels to merge as railway/track mask")
@@ -834,7 +955,46 @@ def main() -> int:
     parser.add_argument("--sam-track-mask-interval", type=int, default=30, help="Run railway mask segmentation every N frames in SAMTracking")
     parser.add_argument("--sam-imgsz", type=int, default=640, help="YOLO inference image size for SAMTracking")
     parser.add_argument("--sam-progress-interval", type=int, default=10, help="Log SAMTracking progress every N processed frames")
+    parser.add_argument("--guard-net-backend", choices=["grounding_dino", "yoloe"], default="grounding_dino")
+    parser.add_argument("--guard-net-text-prompt", default=GUARD_NET_DEFAULT_PROMPT)
+    parser.add_argument("--guard-net-model", default="weights/groundingdino_swint_ogc.pth")
+    parser.add_argument("--guard-net-config", default="groundingdino/config/GroundingDINO_SwinT_OGC.py")
+    parser.add_argument("--guard-net-checkpoint", default="weights/groundingdino_swint_ogc.pth")
+    parser.add_argument("--guard-net-box-threshold", type=float, default=0.10)
+    parser.add_argument("--guard-net-text-threshold", type=float, default=0.10)
+    parser.add_argument("--guard-net-nms-threshold", type=float, default=0.50)
+    parser.add_argument("--guard-net-max-box-area-ratio", type=float, default=0.60)
+    parser.add_argument("--guard-net-scan-frames", type=int, default=30)
+    parser.add_argument("--guard-net-sample-every", type=int, default=5)
+    parser.add_argument("--guard-net-band-side-fraction", type=float, default=0.08)
+    parser.add_argument("--guard-net-band-top-padding", type=int, default=0)
+    parser.add_argument("--guard-net-band-bottom-padding", type=int, default=0)
+    parser.add_argument("--guard-net-band-horizontal-padding", type=int, default=0)
+    parser.add_argument("--guard-net-export-yolo-seg", default="false")
+    parser.add_argument("--guard-net-yolo-class-id", type=int, default=0)
     args = parser.parse_args()
+    raw_argv = sys.argv[1:]
+    guard_net_configured = _guard_net_args_used(raw_argv)
+    guard_net_kwargs = {
+        "guard_net_configured": guard_net_configured,
+        "guard_net_backend": args.guard_net_backend,
+        "guard_net_text_prompt": args.guard_net_text_prompt,
+        "guard_net_model": args.guard_net_model,
+        "guard_net_config": args.guard_net_config,
+        "guard_net_checkpoint": args.guard_net_checkpoint,
+        "guard_net_box_threshold": args.guard_net_box_threshold,
+        "guard_net_text_threshold": args.guard_net_text_threshold,
+        "guard_net_nms_threshold": args.guard_net_nms_threshold,
+        "guard_net_max_box_area_ratio": args.guard_net_max_box_area_ratio,
+        "guard_net_scan_frames": args.guard_net_scan_frames,
+        "guard_net_sample_every": args.guard_net_sample_every,
+        "guard_net_band_side_fraction": args.guard_net_band_side_fraction,
+        "guard_net_band_top_padding": args.guard_net_band_top_padding,
+        "guard_net_band_bottom_padding": args.guard_net_band_bottom_padding,
+        "guard_net_band_horizontal_padding": args.guard_net_band_horizontal_padding,
+        "guard_net_export_yolo_seg": _parse_bool(args.guard_net_export_yolo_seg),
+        "guard_net_yolo_class_id": args.guard_net_yolo_class_id,
+    }
     try:
         resolve_vlm_provider(args.vlm_provider, args.vlm_mode)
     except ValueError as exc:
@@ -846,7 +1006,6 @@ def main() -> int:
         parser.error("--video or --video-dir is required when --input-type video")
     if args.output is None:
         args.output = _default_output_dir()
-    raw_argv = sys.argv[1:]
     run_config = _build_cli_run_config(args, raw_argv)
     _save_cli_run_config(run_config, [args.output])
     if args.input_type == "image":
@@ -884,6 +1043,7 @@ def main() -> int:
                 rule_region_source=args.rule_region_source,
                 recursive=args.recursive,
                 limit=args.batch_limit or None,
+                **guard_net_kwargs,
             )
         else:
             from src.pipeline.analyze_image import run_image_pipeline
@@ -917,6 +1077,7 @@ def main() -> int:
                 sam_object_overlap_threshold=args.sam_object_overlap_threshold,
                 sam_imgsz=args.sam_imgsz,
                 rule_region_source=args.rule_region_source,
+                **guard_net_kwargs,
             )
     else:
         video_source_arg = args.video_dir or args.video
@@ -963,6 +1124,7 @@ def main() -> int:
                 rule_region_source=args.rule_region_source,
                 recursive=args.recursive,
                 limit=args.batch_limit or None,
+                **guard_net_kwargs,
             )
         else:
             result = run_pipeline(
@@ -1005,6 +1167,7 @@ def main() -> int:
                 sam_imgsz=args.sam_imgsz,
                 sam_progress_interval=args.sam_progress_interval,
                 rule_region_source=args.rule_region_source,
+                **guard_net_kwargs,
             )
     run_config_paths = _save_cli_run_config(run_config, _result_output_dirs(result, args.output))
     result["run_config"] = run_config_paths[0]

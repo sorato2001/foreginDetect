@@ -60,12 +60,18 @@ Rule-region source can now be selected explicitly:
 - `--rule-region-source yaml`: use YAML polygon/line ROI rules only.
 - `--rule-region-source sam_track`: use the existing `--sam-track-model`
   railway/track/fence-rail segmentation mask as the mask-IoU rule region.
-- `--rule-region-source auto`: use `sam_track` when `--sam-track-model` is
-  supplied, then fall back to YAML.
+- `--rule-region-source guard_net`: use GroundingDINO boxes, independent SAM2
+  image-predictor masks, merge all box masks into `mask_all`, retain the largest
+  connected fence region, fit robust upper/lower lines, and fill the enclosed
+  continuous band.
+- `--rule-region-source auto`: prefer GuardNet when any `--guard-net-*` option
+  is explicitly supplied, then try `sam_track` when `--sam-track-model` is
+  supplied, and finally fall back to YAML.
 
 The resolved source is written to `sam_tracking_result.json.metadata` as
 `rule_region_source_requested`, `rule_region_source_resolved`, and
-`rule_region_available`.
+`rule_region_available`. Runtime fallback details are stored in
+`rule_region_fallback_reason`.
 
 This branch is STEAD-only. Legacy RTSP/FTP recording code has been removed from
 this branch so the repository is focused on the research prototype.
@@ -133,6 +139,26 @@ python -m pip install decord
 
 cd ../multi_camera_event_system
 ```
+
+### GuardNet Optional Dependencies
+
+GuardNet additionally requires GroundingDINO and the SAM2 installation above.
+Install GroundingDINO into the same environment and provide its config and
+checkpoint through CLI options:
+
+```bash
+git clone https://github.com/IDEA-Research/GroundingDINO.git
+python -m pip install -e GroundingDINO
+```
+
+These imports are lazy. A base installation without GroundingDINO can still run
+`simple_iou`, YAML rule regions, and the existing `sam_track` mode.
+
+GuardNet writes inspection artifacts under `outputs/<event>/guard_net/`:
+`detection_boxes.jpg`, `sam_candidates.jpg`, `mask_all.png`, `fence_refined.png`,
+`continuous_band_mask.png`, `continuous_band_overlay.jpg`, and
+`guard_net_result.json`. Enable `--guard-net-export-yolo-seg true` to also write
+`continuous_band_yolo_seg.txt`.
 
 If this repository already has `../sam2-main`, install that existing copy
 instead:
@@ -461,7 +487,7 @@ Useful CLI switches:
 
 ```text
 --tracker simple_iou|sam_tracking
---rule-region-source yaml|sam_track|auto
+--rule-region-source yaml|sam_track|guard_net|auto
 --sam-object-model <path-to-yolo11l.pt>
 --sam-track-model <path-to-best.pt>
 --sam2-config <path-to-sam2-config.yaml>
@@ -474,6 +500,22 @@ Useful CLI switches:
 --sam-window-size 5
 --sam-confirm-count 3
 --sam-use-optical-flow true
+--guard-net-backend grounding_dino
+--guard-net-text-prompt "black chain link fence. black metal mesh fence. wire mesh fence. protective fence."
+--guard-net-config <GroundingDINO-config.py>
+--guard-net-checkpoint <GroundingDINO-checkpoint.pth>
+--guard-net-box-threshold 0.10
+--guard-net-text-threshold 0.10
+--guard-net-nms-threshold 0.50
+--guard-net-max-box-area-ratio 0.60
+--guard-net-scan-frames 30
+--guard-net-sample-every 5
+--guard-net-band-side-fraction 0.08
+--guard-net-band-top-padding 0
+--guard-net-band-bottom-padding 0
+--guard-net-band-horizontal-padding 0
+--guard-net-export-yolo-seg false
+--guard-net-yolo-class-id 0
 
 
 
@@ -620,6 +662,8 @@ branch or shared externally, rotate it before deployment.
 
 ```bash
   # video
+  python -m src.pipeline.analyze_event --input-type video --video examples/test1.mp4 --camera-id cam02 --rules configs/rules.image.yaml --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights/yolo11l.pt --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --guard-net-config GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py --guard-net-checkpoint weights/groundingdino_swint_ogc.pth --guard-net-scan-frames 30 --guard-net-sample-every 5 --vlm-provider mock
+
   python -m src.pipeline.analyze_event --input-type video  --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/demo_image_sam_gpu --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --max-analysis-frames 0 --visualization-max-frames 0 --log-level DEBUG --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-config sam2_hiera_l.yaml   --sam2-checkpoint weights/sam2_hiera_large.pt --tracker sam_tracking --sam-temporal-mode faithful --sam-imgsz 640 --sam-progress-interval 1 --sam-device cuda
 
   python -m src.pipeline.analyze_event --input-type video --video examples/test_h264.mp4 --camera-id cam02 --rules configs/rules.image.yaml --output outputs/sam_tracking_fast_check --vlm-provider mock --max-analysis-frames 60 --no-visualization --log-level INFO --sam-object-model weights/yolo11l.pt --sam-track-model weights/best.pt --sam-track-labels 1 --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --tracker sam_tracking --sam-temporal-mode fast --sam-sample-every 15 --sam-track-mask-interval 30 --sam-imgsz 640 --sam-progress-interval 1 --sam-device cpu
@@ -629,6 +673,8 @@ branch or shared externally, rotate it before deployment.
 
 
   # image
+  python -m src.pipeline.analyze_event --input-type image --image examples/SchoolFence/Fence4.png --camera-id cam02 --rules configs/rules.image.yaml --tracker sam_tracking --rule-region-source guard_net --sam-object-model weights/yolo11l.pt --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --guard-net-config GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py --guard-net-checkpoint weights/groundingdino_swint_ogc.pth --vlm-provider mock
+
   python -m src.pipeline.analyze_event --input-type image --image examples/RailFence1.png --camera-id cam02 --rules configs/rules.image.yaml --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda --rule-region-source sam_track
 
   python -m src.pipeline.analyze_event --input-type image --image examples/K88+300-1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/K88+300-1 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1  --sam2-enabled true --sam-imgsz 640 --sam-device cuda
