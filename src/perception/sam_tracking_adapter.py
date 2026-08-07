@@ -1306,7 +1306,7 @@ def bbox_to_mask(frame_shape: tuple[int, int] | list[int], bbox: list[float]) ->
     return mask
 
 
-def mask_to_contours(mask: Any, max_contours: int = 8, epsilon_ratio: float = 0.003) -> list[list[list[int]]]:
+def mask_to_contours(mask: Any, max_contours: int = 8, epsilon_ratio: float = 0.0) -> list[list[list[int]]]:
     """Convert a binary mask to compact JSON-friendly contours."""
     if mask is None:
         return []
@@ -1321,8 +1321,9 @@ def mask_to_contours(mask: Any, max_contours: int = 8, epsilon_ratio: float = 0.
         for contour in contours:
             if len(contour) < 3 or cv2.contourArea(contour) < 16:
                 continue
-            epsilon = max(1.0, epsilon_ratio * cv2.arcLength(contour, True))
-            approx = cv2.approxPolyDP(contour, epsilon, True)
+            approx = contour if epsilon_ratio <= 0 else cv2.approxPolyDP(
+                contour, max(1.0, epsilon_ratio * cv2.arcLength(contour, True)), True
+            )
             points = [[int(point[0][0]), int(point[0][1])] for point in approx]
             if len(points) >= 3:
                 encoded.append(points)

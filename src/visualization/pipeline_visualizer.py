@@ -470,7 +470,6 @@ def _draw_sam_tracking_overlay(image: Any, sam_frame: dict[str, Any] | None, cv2
         pts = np.array(contour, dtype=np.int32)
         if len(pts) >= 3:
             cv2.fillPoly(overlay, [pts], mask_fill)
-            cv2.polylines(image, [pts], True, mask_line, 3)
     object_contours = sam_frame.get("object_mask_contours") or []
     object_fill = (0, 0, 220) if alarm or suspicious else (0, 180, 0)
     object_line = (0, 0, 255) if alarm or suspicious else (0, 220, 0)
