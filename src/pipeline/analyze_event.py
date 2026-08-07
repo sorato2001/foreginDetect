@@ -895,6 +895,8 @@ def _sam_tracking_evidence_metadata(sam_tracking_result: SAMTrackingResult, arti
             "source_frame_index": guard_net.get("source_frame_index", guard_net.get("source_frame_indices")),
             "confidence": guard_net.get("aggregate_confidence", guard_net.get("selected_candidate_score")),
             "continuous_band_polygon": geometry.get("polygon"),
+            "continuous_band_polygons": geometry.get("polygons", []),
+            "continuous_band_polygon_count": geometry.get("polygon_count", 0),
             "continuous_band_area": geometry.get("continuous_mask_area"),
         },
         "person_mask_intrusion_evidence": {

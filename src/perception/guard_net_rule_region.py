@@ -116,7 +116,7 @@ class GuardNetRuleRegionGenerator:
             if not candidates:
                 return GuardNetResult(candidate_boxes=[item.bbox for item in detections], error="sam2_no_valid_mask")
             mask_all = np.logical_or.reduce([np.asarray(item.raw_mask).astype(bool) for item in candidates])
-            refined_mask, kept_components = largest_mask_components(mask_all, keep_components=1)
+            refined_mask, continuous_mask, geometry, kept_components = build_component_polygon_regions(mask_all)
             if refined_mask is None:
                 return GuardNetResult(
                     mask_all=mask_all,
@@ -126,12 +126,6 @@ class GuardNetRuleRegionGenerator:
                     metadata={"backend": self.config.backend, "aggregation_mode": "mask_all"},
                     error="mask_all_no_connected_component",
                 )
-            continuous_mask, geometry = build_fitted_line_band(
-                refined_mask,
-                top_padding=self.config.band_top_padding,
-                bottom_padding=self.config.band_bottom_padding,
-                horizontal_padding=self.config.band_horizontal_padding,
-            )
             if continuous_mask is None:
                 return GuardNetResult(
                     raw_mask=refined_mask,
@@ -140,7 +134,7 @@ class GuardNetRuleRegionGenerator:
                     candidate_masks=[item.raw_mask for item in candidates],
                     candidate_boxes=[item.bbox for item in detections],
                     candidate_scores=[self._candidate_json(item) for item in candidates],
-                    metadata={"backend": self.config.backend, "aggregation_mode": "mask_all", "kept_components": kept_components},
+                    metadata={"backend": self.config.backend, "aggregation_mode": "mask_all_component_polygons", "kept_components": kept_components},
                     error="continuous_band_invalid",
                 )
             result = GuardNetResult(
@@ -159,7 +153,8 @@ class GuardNetRuleRegionGenerator:
                     "text_prompt": self.config.text_prompt,
                     "source_frame_index": 0,
                     "candidate_count": len(candidates),
-                    "aggregation_mode": "mask_all_largest_component_ransac_lines",
+                    "aggregation_mode": "mask_all_component_polygons",
+                    "polygon_count": int(geometry.get("polygon_count", 0)),
                     "mask_all_area": int(mask_all.sum()),
                     "refined_mask_area": int(refined_mask.sum()),
                     "kept_components": kept_components,
@@ -219,15 +214,9 @@ class GuardNetRuleRegionGenerator:
         if not usable:
             return GuardNetResult(error="guard_net_scan_no_valid_mask_all")
         mask_all = np.logical_or.reduce([np.asarray(item.mask_all).astype(bool) for item in usable])
-        refined_mask, kept_components = largest_mask_components(mask_all, keep_components=1)
+        refined_mask, continuous_mask, geometry, kept_components = build_component_polygon_regions(mask_all)
         if refined_mask is None:
             return GuardNetResult(mask_all=mask_all, error="mask_all_no_connected_component")
-        continuous_mask, geometry = build_fitted_line_band(
-            refined_mask,
-            top_padding=self.config.band_top_padding,
-            bottom_padding=self.config.band_bottom_padding,
-            horizontal_padding=self.config.band_horizontal_padding,
-        )
         if continuous_mask is None:
             return GuardNetResult(mask_all=mask_all, refined_mask=refined_mask, error="continuous_band_invalid")
         result = GuardNetResult(
@@ -245,7 +234,8 @@ class GuardNetRuleRegionGenerator:
                 "text_prompt": self.config.text_prompt,
                 "source_frame_indices": [item.metadata.get("source_frame_index") for item in usable],
                 "candidate_count": sum(len(item.candidate_scores) for item in usable),
-                "aggregation_mode": "multi_frame_mask_all_largest_component_ransac_lines",
+                "aggregation_mode": "multi_frame_mask_all_component_polygons",
+                "polygon_count": int(geometry.get("polygon_count", 0)),
                 "mask_all_area": int(mask_all.sum()),
                 "refined_mask_area": int(refined_mask.sum()),
                 "kept_components": kept_components,
@@ -388,23 +378,32 @@ class GuardNetRuleRegionGenerator:
             for box in result.candidate_boxes:
                 x1, y1, x2, y2 = [int(value) for value in box]
                 cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 220, 255), 2)
-            polygon = geometry.get("polygon") or []
-            if len(polygon) == 4:
+            polygons = geometry.get("polygons") or []
+            colors = [(255, 255, 255), (0, 165, 255), (255, 0, 255), (0, 255, 255), (255, 0, 0)]
+            for index, item in enumerate(polygons):
+                polygon = item.get("polygon") or []
+                if len(polygon) < 3:
+                    continue
                 poly = np.asarray(polygon, dtype=np.int32)
+                color = colors[index % len(colors)]
+                polygon_layer = overlay.copy()
+                cv2.fillPoly(polygon_layer, [poly], color)
+                overlay = cv2.addWeighted(overlay, 0.65, polygon_layer, 0.35, 0.0)
                 cv2.polylines(overlay, [poly], True, (255, 255, 255), 2)
                 for point in poly:
-                    cv2.circle(overlay, tuple(int(value) for value in point), 5, (255, 0, 255), -1)
-                cv2.line(overlay, tuple(poly[0]), tuple(poly[1]), (0, 0, 255), 4, cv2.LINE_AA)
-                cv2.line(overlay, tuple(poly[3]), tuple(poly[2]), (255, 165, 0), 4, cv2.LINE_AA)
-                cv2.putText(overlay, "top line", tuple(poly[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                cv2.putText(overlay, "bottom line", tuple(poly[3]), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+                    cv2.circle(overlay, tuple(int(value) for value in point), 4, color, -1)
+                cv2.putText(overlay, f"fence {index + 1}", tuple(poly[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             cv2.imwrite(str(output / "continuous_band_overlay.jpg"), overlay)
             (output / "guard_net_result.json").write_text(json.dumps(self._json_metadata(result), ensure_ascii=False, indent=2), encoding="utf-8")
             if self.config.export_yolo_seg and result.continuous_band_geometry:
-                polygon = result.continuous_band_geometry["polygon"]
                 height, width = overlay.shape[:2]
-                values = [float(value) for point in polygon for value in (point[0] / width, point[1] / height)]
-                (output / "continuous_band_yolo_seg.txt").write_text(" ".join([str(self.config.yolo_class_id), *[f"{value:.6f}" for value in values]]) + "\n", encoding="utf-8")
+                lines = []
+                for item in result.continuous_band_geometry.get("polygons", []):
+                    polygon = item.get("polygon") or []
+                    values = [float(value) for point in polygon for value in (point[0] / width, point[1] / height)]
+                    if len(values) >= 6:
+                        lines.append(" ".join([str(self.config.yolo_class_id), *[f"{value:.6f}" for value in values]]))
+                (output / "continuous_band_yolo_seg.txt").write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         except Exception as exc:
             logger.warning("GuardNet artifact save failed: %s", exc)
 
@@ -520,6 +519,84 @@ def largest_mask_components(
             }
         )
     return (refined if refined.any() else None), kept
+
+
+def build_component_polygon_regions(
+    mask_all: Any,
+    min_area_ratio: float = 0.01,
+    min_area: int = 64,
+    max_components: int = 12,
+) -> tuple[Any | None, Any | None, dict[str, Any] | None, list[dict[str, Any]]]:
+    """Keep each substantial mask component and fit an independent polygon.
+
+    Components are filtered relative to the largest component, so a second
+    fence section is retained while tiny SAM speckles are discarded. Polygon
+    masks are used for the rule region; the refined mask remains the exact
+    union of retained component pixels for inspection and IoU operations.
+    """
+    import cv2
+    import numpy as np
+
+    binary = np.asarray(mask_all).astype(bool)
+    if binary.ndim != 2 or not binary.any():
+        return None, None, None, []
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary.astype(np.uint8), 8)
+    ranked = sorted(
+        ((index, int(stats[index, cv2.CC_STAT_AREA])) for index in range(1, count)),
+        key=lambda item: item[1], reverse=True,
+    )
+    if not ranked:
+        return None, None, None, []
+    largest_area = ranked[0][1]
+    refined = np.zeros(binary.shape, dtype=np.uint8)
+    continuous = np.zeros(binary.shape, dtype=np.uint8)
+    polygons: list[dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
+    for rank, (label, area) in enumerate(ranked[:max(1, max_components)]):
+        if area < max(min_area, int(round(largest_area * min_area_ratio))):
+            continue
+        component = (labels == label).astype(np.uint8)
+        refined[component > 0] = 1
+        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        hull = cv2.convexHull(contour)
+        epsilon = max(1.0, 0.015 * cv2.arcLength(hull, True))
+        approx = cv2.approxPolyDP(hull, epsilon, True).reshape(-1, 2)
+        if len(approx) < 3:
+            approx = hull.reshape(-1, 2)
+        if len(approx) < 3:
+            continue
+        polygon = [[int(point[0]), int(point[1])] for point in approx]
+        polygon_mask = np.zeros(binary.shape, dtype=np.uint8)
+        cv2.fillPoly(polygon_mask, [np.asarray(polygon, dtype=np.int32)], 1)
+        continuous[polygon_mask > 0] = 1
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        item = {
+            "component": int(rank),
+            "area": int(area),
+            "area_ratio": float(area / max(1, largest_area)),
+            "bbox": [x, y, x + width, y + height],
+            "polygon": polygon,
+            "raw_area": int(area),
+            "polygon_area": int(polygon_mask.sum()),
+        }
+        kept.append({key: item[key] for key in ("component", "area", "area_ratio", "bbox")})
+        polygons.append(item)
+    if not polygons:
+        return None, None, None, []
+    geometry = {
+        "mode": "mask_all_component_polygons",
+        "polygons": polygons,
+        "polygon_count": len(polygons),
+        "raw_mask_area": int(refined.sum()),
+        "continuous_mask_area": int(continuous.sum()),
+    }
+    return refined.astype(bool), continuous.astype(bool), geometry, kept
 
 
 def _boundary_points(mask: Any, min_height_ratio: float = 0.05) -> tuple[Any, Any, Any]:
