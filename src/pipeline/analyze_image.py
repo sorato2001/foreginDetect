@@ -125,17 +125,6 @@ def run_image_pipeline(
     sam_object_overlap_threshold: float = 0.15,
     sam_imgsz: int = 640,
     rule_region_source: str = "auto",
-    guard_net_requested: bool = False,
-    guard_net_text_prompt: str | None = None,
-    guard_net_box_threshold: float = 0.12,
-    guard_net_text_threshold: float = 0.12,
-    guard_net_max_box_area_ratio: float = 0.85,
-    guard_net_candidate_count: int = 12,
-    guard_net_crop_roi: str | None = None,
-    guard_net_mask_output_mode: str = "continuous-band",
-    guard_net_continuous_band_margin: int = 4,
-    guard_net_continuous_band_endpoint_source: str = "largest-component",
-    guard_net_save_selected_sam_mask: bool = False,
 ) -> dict[str, Any]:
     """Run STEAD analysis on a single image and write standard artifacts."""
     event_id = event_id or f"image_{uuid.uuid4().hex[:8]}"
@@ -166,7 +155,7 @@ def run_image_pipeline(
     if tracker == "sam_tracking" and not mock_detections:
         from src.pipeline.analyze_event import _resolve_rule_region_source
 
-        resolved_rule_region_source = _resolve_rule_region_source(rule_region_source, tracker, sam_track_model, guard_net_requested)
+        resolved_rule_region_source = _resolve_rule_region_source(rule_region_source, tracker, sam_track_model)
         sam_config = SAMTrackingConfig(
             object_model_path=sam_object_model or SAMTrackingConfig().object_model_path,
             track_model_path=sam_track_model or SAMTrackingConfig().track_model_path,
@@ -185,16 +174,6 @@ def run_image_pipeline(
             track_mask_interval=1,
             imgsz=sam_imgsz,
             output_dir=str(out),
-            guard_net_text_prompt=guard_net_text_prompt or SAMTrackingConfig().guard_net_text_prompt,
-            guard_net_box_threshold=guard_net_box_threshold,
-            guard_net_text_threshold=guard_net_text_threshold,
-            guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
-            guard_net_candidate_count=guard_net_candidate_count,
-            guard_net_crop_roi=guard_net_crop_roi,
-            guard_net_mask_output_mode=guard_net_mask_output_mode,
-            guard_net_continuous_band_margin=guard_net_continuous_band_margin,
-            guard_net_continuous_band_endpoint_source=guard_net_continuous_band_endpoint_source,
-            guard_net_save_selected_sam_mask=guard_net_save_selected_sam_mask,
         )
         sam_tracking_result = _detect_image_with_sam_tracking(image_path, sam_config)
         tracks = sam_tracking_result.tracks
@@ -266,16 +245,6 @@ def run_image_pipeline(
     if sam_tracking_result is not None:
         sam_tracking_artifact = str(out / "sam_tracking_result.json")
         save_json(sam_tracking_result.to_json_dict(), sam_tracking_artifact)
-        guard_net_meta = sam_tracking_result.metadata.get("guard_net") or {}
-        if sam_tracking_result.metadata.get("rule_region_source_resolved") == "guard_net":
-            save_json(
-                {
-                    "source": "guard_net",
-                    "available": sam_tracking_result.metadata.get("rule_region_available"),
-                    "metadata": guard_net_meta,
-                },
-                str(out / "guard_net_region_result.json"),
-            )
         evidence.metadata["sam_tracking"] = {
             "artifact": sam_tracking_artifact,
             "degraded": sam_tracking_result.metadata.get("degraded"),
@@ -402,17 +371,6 @@ def run_image_batch_pipeline(
     sam_object_overlap_threshold: float = 0.15,
     sam_imgsz: int = 640,
     rule_region_source: str = "auto",
-    guard_net_requested: bool = False,
-    guard_net_text_prompt: str | None = None,
-    guard_net_box_threshold: float = 0.12,
-    guard_net_text_threshold: float = 0.12,
-    guard_net_max_box_area_ratio: float = 0.85,
-    guard_net_candidate_count: int = 12,
-    guard_net_crop_roi: str | None = None,
-    guard_net_mask_output_mode: str = "continuous-band",
-    guard_net_continuous_band_margin: int = 4,
-    guard_net_continuous_band_endpoint_source: str = "largest-component",
-    guard_net_save_selected_sam_mask: bool = False,
     recursive: bool = False,
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -458,17 +416,6 @@ def run_image_batch_pipeline(
                 sam_object_overlap_threshold=sam_object_overlap_threshold,
                 sam_imgsz=sam_imgsz,
                 rule_region_source=rule_region_source,
-                guard_net_requested=guard_net_requested,
-                guard_net_text_prompt=guard_net_text_prompt,
-                guard_net_box_threshold=guard_net_box_threshold,
-                guard_net_text_threshold=guard_net_text_threshold,
-                guard_net_max_box_area_ratio=guard_net_max_box_area_ratio,
-                guard_net_candidate_count=guard_net_candidate_count,
-                guard_net_crop_roi=guard_net_crop_roi,
-                guard_net_mask_output_mode=guard_net_mask_output_mode,
-                guard_net_continuous_band_margin=guard_net_continuous_band_margin,
-                guard_net_continuous_band_endpoint_source=guard_net_continuous_band_endpoint_source,
-                guard_net_save_selected_sam_mask=guard_net_save_selected_sam_mask,
             )
             result["source_image"] = str(item)
             copied_visualizations = _copy_batch_visualizations(result, batch_vis_dir, f"{index:04d}_{item.stem}")

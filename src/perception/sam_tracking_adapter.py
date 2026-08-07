@@ -96,19 +96,6 @@ class SAMTrackingConfig:
     imgsz: int = 640
     progress_interval: int = 10
     output_dir: str | None = None
-    guard_net_text_prompt: str = (
-        "black chain link fence mesh wires. black metal mesh fence posts. "
-        "continuous wire guard net. protective wire mesh barrier. fence panels."
-    )
-    guard_net_box_threshold: float = 0.12
-    guard_net_text_threshold: float = 0.12
-    guard_net_max_box_area_ratio: float = 0.85
-    guard_net_candidate_count: int = 12
-    guard_net_crop_roi: str | None = None
-    guard_net_mask_output_mode: str = "continuous-band"
-    guard_net_continuous_band_margin: int = 4
-    guard_net_continuous_band_endpoint_source: str = "largest-component"
-    guard_net_save_selected_sam_mask: bool = False
 
 
 @dataclass(slots=True)
@@ -278,7 +265,6 @@ class SAMTrackingAdapter:
         self._sam2_tracker: _SAM2VideoMemoryTracker | None = None
         self._sam2_temp_video: Path | None = None
         self._smoothers: dict[int, _OpticalFlowProbabilitySmoother] = {}
-        self._guard_net_result: Any | None = None
         self._load_models()
 
     def analyze_video(self, video_path: str, max_frames: int | None = 900) -> SAMTrackingResult:
@@ -582,8 +568,6 @@ class SAMTrackingAdapter:
         source = (self.config.rule_region_source or "sam_track").strip().lower()
         if source == "yaml":
             return None
-        if source == "guard_net":
-            return self._detect_guard_net_mask(frame)
         if self._track_model is None:
             return None
         try:
@@ -642,49 +626,6 @@ class SAMTrackingAdapter:
             return merged if has_any else None
         except Exception as exc:
             logger.warning("SAMTracking track segmentation failed: %s", exc)
-            return None
-
-    def _detect_guard_net_mask(self, frame: Any) -> Any | None:
-        """Generate or reuse a GroundingDINO + SAM2 guard-net rule mask."""
-        if self._guard_net_result is not None:
-            return getattr(self._guard_net_result, "mask", None)
-        try:
-            from src.perception.guard_net_region_adapter import GuardNetRegionAdapter, GuardNetRegionConfig
-
-            config = GuardNetRegionConfig(
-                text_prompt=self.config.guard_net_text_prompt,
-                box_threshold=self.config.guard_net_box_threshold,
-                text_threshold=self.config.guard_net_text_threshold,
-                max_box_area_ratio=self.config.guard_net_max_box_area_ratio,
-                candidate_count=self.config.guard_net_candidate_count,
-                crop_roi=self.config.guard_net_crop_roi,
-                mask_output_mode=self.config.guard_net_mask_output_mode,
-                continuous_band_margin=self.config.guard_net_continuous_band_margin,
-                continuous_band_endpoint_source=self.config.guard_net_continuous_band_endpoint_source,
-                save_selected_sam_mask=self.config.guard_net_save_selected_sam_mask,
-            )
-            output_dir = Path(self.config.output_dir) / "guard_net" if self.config.output_dir else None
-            adapter = GuardNetRegionAdapter(
-                config,
-                sam2_config=self.config.sam2_config,
-                sam2_checkpoint=self.config.sam2_checkpoint,
-                device=self._runtime_device,
-                output_dir=output_dir,
-            )
-            self._guard_net_result = adapter.analyze_frame(frame, frame_index=0)
-            if not self._guard_net_result.available:
-                logger.warning("Guard-net rule region unavailable: %s", self._guard_net_result.fallback_reason)
-                return None
-            logger.info(
-                "Guard-net rule region ready: candidate=%s score=%s mode=%s",
-                self._guard_net_result.selected_candidate_index,
-                self._guard_net_result.selection_score,
-                self._guard_net_result.mask_output_mode,
-            )
-            return self._guard_net_result.mask
-        except Exception as exc:
-            logger.warning("Guard-net rule region failed: %s", exc)
-            self._guard_net_result = None
             return None
 
     def segment_objects(
@@ -919,25 +860,13 @@ class SAMTrackingAdapter:
     def _metadata(self, degraded: bool, error: str | None = None) -> dict[str, Any]:
         requested = self.config.rule_region_source_requested or self.config.rule_region_source
         resolved = self.config.rule_region_source or requested
-        guard_result = self._guard_net_result
-        guard_meta = getattr(guard_result, "metadata", None) if guard_result is not None else None
-        guard_available = bool(getattr(guard_result, "available", False)) if guard_result is not None else False
-        rule_region_available: bool | None
-        if resolved == "guard_net":
-            rule_region_available = guard_available
-        elif resolved == "sam_track":
+        if resolved == "sam_track":
             rule_region_available = self._track_model is not None
         else:
             rule_region_available = False
-        if resolved == "guard_net" and guard_meta is None:
-            guard_meta = {
-                "enabled": True,
-                "fallback_reason": getattr(guard_result, "fallback_reason", None) if guard_result is not None else error,
-            }
         rule_region_step = {
             "yaml": "yaml_roi_rule_region",
             "sam_track": "sam_track_segmentation_rule_region",
-            "guard_net": "groundingdino_sam2_guard_net_rule_region",
         }.get(resolved, f"{resolved}_rule_region")
         return {
             "adapter": "sam_tracking",
@@ -955,7 +884,6 @@ class SAMTrackingAdapter:
             "rule_region_source_requested": requested,
             "rule_region_source_resolved": resolved,
             "rule_region_available": rule_region_available,
-            "guard_net": guard_meta or {"enabled": resolved == "guard_net", "fallback_reason": None},
             "object_model_path": self.config.object_model_path,
             "track_model_path": self.config.track_model_path,
             "object_model_loaded": self._object_model is not None,

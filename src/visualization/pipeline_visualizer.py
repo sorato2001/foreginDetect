@@ -361,8 +361,8 @@ def _write_annotated_video(
     if width <= 0 or height <= 0:
         cap.release()
         return False
-    render_stride = _sam_visualization_render_stride(sam_tracking)
-    output_fps = max(1.0, fps / max(1, render_stride))
+    render_stride = 1
+    output_fps = max(1.0, fps)
     writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
     frame_index = 0
     written = 0
@@ -410,27 +410,12 @@ def _nearest_sam_frame(sam_tracking: dict[str, Any] | None, frame_index: int) ->
     return best
 
 
-def _sam_visualization_render_stride(sam_tracking: dict[str, Any] | None) -> int:
-    """Synchronize GuardNet fast-mode videos with sampled object detections."""
-    if not sam_tracking:
-        return 1
-    metadata = sam_tracking.get("metadata") or {}
-    if metadata.get("rule_region_source_resolved") != "guard_net":
-        return 1
-    if metadata.get("temporal_mode") != "fast":
-        return 1
-    try:
-        return max(1, int(metadata.get("sample_every") or 1))
-    except (TypeError, ValueError):
-        return 1
-
-
 def _sam_visualization_rendering_summary(
     sam_tracking: dict[str, Any] | None,
     max_video_frames: int | None = None,
 ) -> dict[str, Any]:
     """Return metadata about annotated video frame sampling."""
-    stride = _sam_visualization_render_stride(sam_tracking)
+    stride = 1
     metadata = sam_tracking.get("metadata") if isinstance(sam_tracking, dict) else {}
     metadata = metadata if isinstance(metadata, dict) else {}
     return {
@@ -478,14 +463,9 @@ def _draw_sam_tracking_overlay(image: Any, sam_frame: dict[str, Any] | None, cv2
     alarm = bool(sam_frame.get("alarm"))
     suspicious = bool(sam_frame.get("suspicious"))
     rule_fill, rule_line = _rule_region_state_colors(alarm=alarm, suspicious=suspicious)
-    if rule_region_source == "guard_net":
-        mask_fill = rule_fill
-        mask_line = rule_line
-        mask_label = "guard-net rule region"
-    else:
-        mask_fill = rule_fill
-        mask_line = rule_line
-        mask_label = "segmentation rule region"
+    mask_fill = rule_fill
+    mask_line = rule_line
+    mask_label = "segmentation rule region"
     for contour in track_contours:
         pts = np.array(contour, dtype=np.int32)
         if len(pts) >= 3:
@@ -544,8 +524,6 @@ def _rule_region_state_colors(alarm: bool, suspicious: bool) -> tuple[tuple[int,
 
 
 def _rule_region_display_name(rule_region_source: str) -> str:
-    if rule_region_source == "guard_net":
-        return "GuardNet"
     if rule_region_source == "sam_track":
         return "SAMTrack"
     return "SegRule"
