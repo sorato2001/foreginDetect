@@ -496,7 +496,7 @@ CLI 参数说明：
 | `--batch-limit <n>` | 批处理最多处理多少个文件。`0` 表示不限制。 |
 | `--camera-id <id>` | 摄像头 ID，写入 evidence、日志和结果 JSON。 |
 
-| `--output <dir>` | 输出目录。单视频/单图直接写入该目录；批处理会在该目录下按文件名创建子目录，并生成 `batch_summary.json`。 |
+| `--output <dir>` | 可选输出目录。未提供时自动使用 `outputs/YYYYMMDDHHMMSS`；若同一秒目录已存在则追加序号。批处理会在该目录下按文件名创建子目录。 |
 | `--event-id <id>` | 可选事件 ID；不传时自动生成。批处理会为每个文件自动生成独立 ID。 |
 | `--mock-detections` | 使用内置假检测结果，适合快速测试 CLI、日志、VLM 和输出结构，不调用真实检测模型。 |
 | `--no-visualization` | 跳过可视化输出，减少运行时间。 |
@@ -559,6 +559,12 @@ Each run writes step-by-step logs to both the console and:
 ```text
 outputs/<event>/pipeline.log
 ```
+
+Each CLI run also writes `run_config.json` to the output directory. It contains
+the original command, a replay command with the generated output path, every
+parsed CLI argument including defaults, effective normalized settings, and the
+Python runtime environment. Batch runs copy the same snapshot into each
+successful item output directory.
 
 The log covers:
 
@@ -623,7 +629,7 @@ branch or shared externally, rotate it before deployment.
 
 
   # image
-  python -m src.pipeline.analyze_event --input-type image --image examples/RailFence4.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/202608071450 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda --rule-region-source sam_track
+  python -m src.pipeline.analyze_event --input-type image --image examples/RailFence1.png --camera-id cam02 --rules configs/rules.image.yaml --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1 --sam2-enabled true --sam2-config sam2_hiera_l.yaml --sam2-checkpoint weights/sam2_hiera_large.pt --sam-imgsz 640 --sam-device cuda --rule-region-source sam_track
 
   python -m src.pipeline.analyze_event --input-type image --image examples/K88+300-1.png --camera-id cam02 --rules configs/rules.image.yaml --output outputs/K88+300-1 --vlm-provider qwen --vlm-timeout 60 --vlm-max-retries 2 --vlm-fallback-on-error true --tracker sam_tracking --sam-object-model weights/yolo11l.pt --sam-track-model weights/FenceRail.pt --sam-track-labels 1  --sam2-enabled true --sam-imgsz 640 --sam-device cuda
 

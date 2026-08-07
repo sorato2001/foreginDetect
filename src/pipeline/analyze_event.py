@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import platform
 import shutil
+import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,7 @@ from src.visualization.pipeline_visualizer import save_pipeline_visualization
 logger = logging.getLogger("stead.pipeline")
 
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".webm"}
+RUN_CONFIG_FILENAME = "run_config.json"
 
 
 def _copy_batch_visualizations(result: dict[str, Any], batch_vis_dir: Path, prefix: str) -> list[dict[str, str]]:
@@ -65,6 +69,81 @@ def _parse_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _default_output_dir(now: datetime | None = None) -> str:
+    """Return a timestamped output directory that does not overwrite an existing run."""
+    timestamp = (now or datetime.now()).strftime("%Y%m%d%H%M%S")
+    base = Path("outputs") / timestamp
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = Path(f"{base}_{suffix:02d}")
+        suffix += 1
+    return str(candidate)
+
+
+def _build_cli_run_config(args: argparse.Namespace, raw_argv: list[str]) -> dict[str, Any]:
+    """Build a reproducible snapshot of parsed CLI arguments and effective settings."""
+    arguments = dict(vars(args))
+    effective_settings = dict(arguments)
+    effective_settings.update(
+        {
+            "batch_limit": args.batch_limit or None,
+            "max_analysis_frames": args.max_analysis_frames or None,
+            "visualization_max_frames": args.visualization_max_frames or None,
+            "vlm_fallback_on_error": _parse_bool(args.vlm_fallback_on_error),
+            "save_visualization": not args.no_visualization,
+            "sam_track_labels": _parse_csv(args.sam_track_labels),
+            "sam_use_optical_flow": _parse_bool(args.sam_use_optical_flow),
+            "sam2_enabled": _parse_bool(args.sam2_enabled),
+        }
+    )
+    command_parts = ["python", "-m", "src.pipeline.analyze_event", *raw_argv]
+    output_was_explicit = any(item == "--output" or item.startswith("--output=") for item in raw_argv)
+    replay_parts = list(command_parts)
+    if not output_was_explicit:
+        replay_parts.extend(["--output", str(args.output)])
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "command": subprocess.list2cmdline(command_parts),
+        "replay_command": subprocess.list2cmdline(replay_parts),
+        "output_was_explicit": output_was_explicit,
+        "arguments_include_defaults": True,
+        "arguments": arguments,
+        "effective_settings": effective_settings,
+        "runtime": {
+            "cwd": str(Path.cwd()),
+            "python_executable": sys.executable,
+            "python_version": platform.python_version(),
+            "platform": platform.platform(),
+        },
+    }
+
+
+def _save_cli_run_config(config: dict[str, Any], output_dirs: list[str | Path]) -> list[str]:
+    """Write the CLI snapshot to each distinct output directory."""
+    saved: list[str] = []
+    seen: set[str] = set()
+    for output_dir in output_dirs:
+        path = Path(output_dir) / RUN_CONFIG_FILENAME
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        save_json(config, str(path))
+        saved.append(str(path))
+    return saved
+
+
+def _result_output_dirs(result: dict[str, Any], root_output: str) -> list[str]:
+    """Collect root and successful batch-item output directories."""
+    output_dirs = [root_output]
+    for item in result.get("results") or []:
+        if isinstance(item, dict) and item.get("output_dir"):
+            output_dirs.append(str(item["output_dir"]))
+    return output_dirs
 
 
 def _validate_rule_region_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -719,7 +798,7 @@ def main() -> int:
     parser.add_argument("--batch-limit", type=int, default=0, help="For input directories, limit number of files; 0 means no limit")
     parser.add_argument("--camera-id", required=True)
     parser.add_argument("--rules", default="configs/rules.example.yaml")
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", default=None, help="Output directory; defaults to outputs/YYYYMMDDHHMMSS")
     parser.add_argument("--vlm-provider", choices=["auto", "mock", "qwen", "gemma", "local_gemma"], default="auto")
     parser.add_argument("--vlm-mode", "--vlm_mode", dest="vlm_mode", choices=["local", "web"], default="web", help="local uses LAN Gemma VLM; web uses Qwen/DashScope")
     parser.add_argument("--vlm-local-endpoint", default="http://localhost:8082/v1/chat/completions")
@@ -761,9 +840,16 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
     _validate_rule_region_args(parser, args)
+    if args.input_type == "image" and not args.image:
+        parser.error("--image is required when --input-type image")
+    if args.input_type == "video" and not (args.video_dir or args.video):
+        parser.error("--video or --video-dir is required when --input-type video")
+    if args.output is None:
+        args.output = _default_output_dir()
+    raw_argv = sys.argv[1:]
+    run_config = _build_cli_run_config(args, raw_argv)
+    _save_cli_run_config(run_config, [args.output])
     if args.input_type == "image":
-        if not args.image:
-            parser.error("--image is required when --input-type image")
         image_source = Path(args.image)
         if image_source.is_dir():
             from src.pipeline.analyze_image import run_image_batch_pipeline
@@ -834,8 +920,6 @@ def main() -> int:
             )
     else:
         video_source_arg = args.video_dir or args.video
-        if not video_source_arg:
-            parser.error("--video or --video-dir is required when --input-type video")
         video_source = Path(video_source_arg)
         if video_source.is_dir():
             result = run_video_batch_pipeline(
@@ -922,6 +1006,8 @@ def main() -> int:
                 sam_progress_interval=args.sam_progress_interval,
                 rule_region_source=args.rule_region_source,
             )
+    run_config_paths = _save_cli_run_config(run_config, _result_output_dirs(result, args.output))
+    result["run_config"] = run_config_paths[0]
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
